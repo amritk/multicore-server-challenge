@@ -28,6 +28,8 @@ fi
 
 # shellcheck disable=SC2086 # NISH_PACKAGES is a list of words on purpose
 PATH="/opt/node/bin:$PATH" npm install -g --prefix /opt/nish --no-audit --no-fund ${NISH_PACKAGES:-nish@$NISH_VERSION}
-chmod -R a+rX /opt/node /opt/nish
+# Readable by every user and writable only by root, whatever umask npm ran
+# under: the compiler refuses a package directory every user can write.
+chmod -R a+rX,go-w /opt/node /opt/nish
 /opt/nish/bin/nish --version
 clang-18 --version | head -n 1
