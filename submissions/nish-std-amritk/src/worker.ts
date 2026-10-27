@@ -314,6 +314,10 @@ class ConduitReq {
   batchNext: i32 = -1
   /** A write sent alone, after its batch failed; a read sent alone, outside a read plan. */
   solo: boolean = false
+  /** A favorite or unfavorite whose write its batch's `favorite_many` or `unfavorite_many` makes: it reads its article only. */
+  folded: boolean = false
+  /** On a batch's first request: how many statements bound before its own, which answer no request. */
+  prefix: i32 = 0
   /** A batched write's own answer: its writer and the buffer it writes. */
   own: u8[]
   ownWriter: JsonWriter
@@ -363,6 +367,8 @@ class ConduitReq {
     this.pgError = 0
     this.batchNext = -1
     this.solo = false
+    this.folded = false
+    this.prefix = 0
   }
 
   /**
@@ -592,8 +598,9 @@ export class ConduitWorker {
   writeBatches: i32 = 0
   /** The chains of writes `bindAll` held back this pump, by their first request. */
   deferred: i32[]
-  /** Per write-pool slot: the request of its batch whose statements are being answered. */
+  /** Per write-pool slot: the request of its batch whose statements are being answered, and the batch's statements before it left. */
   writeCursor: i32[]
+  writePrefix: i32[]
   /** The read plans, each one's `PLAN_` state, and the reads waiting for the next, a ring oldest first. */
   plans: ReadPlan[]
   planState: i32[]
@@ -705,6 +712,7 @@ export class ConduitWorker {
     this.writeRing = new Array<i32>(QUEUE)
     this.deferred = []
     this.writeCursor = new Array<i32>(this.pools[POOL_WRITE].size)
+    this.writePrefix = new Array<i32>(this.pools[POOL_WRITE].size)
     registerPlanStatements(this.pools[POOL_READ])
     this.plans = []
     this.planState = []
@@ -1871,6 +1879,15 @@ export class ConduitWorker {
    * refused.
    */
   bindAll(r: ConduitReq, conn: PgConnection): boolean {
+    r.prefix = 0
+    if (r.pool === POOL_WRITE && !r.solo && r.batchNext >= 0) {
+      if (!this.foldFavorites(r, conn)) {
+        return false
+      }
+    } else {
+      // Alone (a write sent again after its batch failed, too), it makes its own write.
+      r.folded = false
+    }
     let prev: i32 = -1
     let k: i32 = r.index
     while (k >= 0) {
@@ -1901,12 +1918,107 @@ export class ConduitWorker {
     return true
   }
 
+  /**
+   * Folds the favorites and unfavorites of the batch `r` leads into one
+   * statement of each kind, bound before the batch's own: a folded request
+   * then reads its article only. A request is folded only when its slug is
+   * text and no other favorite or unfavorite of the batch has its viewer, so
+   * the order of one viewer's toggles is the order they came in. Both writes
+   * are idempotent: one the batch holds back (`bindAll`) and sends again
+   * gets the same answer. False when a bind was refused.
+   */
+  foldFavorites(r: ConduitReq, conn: PgConnection): boolean {
+    let k: i32 = r.index
+    let n: i32 = 0
+    while (k >= 0) {
+      const m: ConduitReq = this.reqs[k]
+      m.folded = false
+      if (m.route === R_FAVORITE || m.route === R_UNFAVORITE) {
+        n += 1
+      }
+      k = m.batchNext
+    }
+    if (n < 2) {
+      return true
+    }
+    let folds: i32 = 0
+    k = r.index
+    while (k >= 0) {
+      const m: ConduitReq = this.reqs[k]
+      if (m.route === R_FAVORITE || m.route === R_UNFAVORITE) {
+        const start: i32 = m.fStart[F_PATH]
+        const len: i32 = m.fLen[F_PATH]
+        let alone: boolean = len > 0 && len <= PLAN_KEY_MAX && isText(m.text, start, start + len)
+        let j: i32 = r.index
+        while (alone && j >= 0) {
+          const o: ConduitReq = this.reqs[j]
+          if (j !== k && (o.route === R_FAVORITE || o.route === R_UNFAVORITE) && o.viewer === m.viewer) {
+            alone = false
+          }
+          j = o.batchNext
+        }
+        m.folded = alone
+        folds += alone ? 1 : 0
+      }
+      k = m.batchNext
+    }
+    if (folds < 2) {
+      k = r.index
+      while (k >= 0) {
+        this.reqs[k].folded = false
+        k = this.reqs[k].batchNext
+      }
+      return true
+    }
+    for (let kind: i32 = 0; kind < 2; kind++) {
+      const route: i32 = kind === 0 ? R_FAVORITE : R_UNFAVORITE
+      let any: boolean = false
+      k = r.index
+      while (k >= 0 && !any) {
+        any = this.reqs[k].folded && this.reqs[k].route === route
+        k = this.reqs[k].batchNext
+      }
+      if (!any) {
+        continue
+      }
+      if (!conn.bindStart(kind === 0 ? "favorite_many" : "unfavorite_many") || !conn.arrayStart()) {
+        return false
+      }
+      for (let half: i32 = 0; half < 2; half++) {
+        if (half === 1 && !conn.arrayStart()) {
+          return false
+        }
+        k = r.index
+        while (k >= 0) {
+          const m: ConduitReq = this.reqs[k]
+          if (m.folded && m.route === route) {
+            const ok: boolean =
+              half === 0
+                ? conn.arrayInt(m.viewer)
+                : conn.arrayElement(m.text, m.fStart[F_PATH], m.fLen[F_PATH])
+            if (!ok) {
+              conn.arrayEnd()
+              return false
+            }
+          }
+          k = m.batchNext
+        }
+        conn.arrayEnd()
+      }
+      if (!conn.bindEnd()) {
+        return false
+      }
+      r.prefix += 1
+    }
+    return true
+  }
+
   /** How many statements `r`'s group runs, so a batch knows where each request's answers end. */
   statements(r: ConduitReq): i32 {
     switch (r.route) {
       case R_FAVORITE:
       case R_UNFAVORITE:
-        return 2
+        return r.folded ? 1 : 2
       case R_ARTICLE_CREATE:
         return r.tags > 0 ? 4 : 2
       case R_ARTICLE_PUT:
@@ -2072,6 +2184,7 @@ export class ConduitWorker {
     if (this.current[POOL_WRITE][s] !== ticket) {
       this.current[POOL_WRITE][s] = ticket
       this.writeCursor[s] = leader
+      this.writePrefix[s] = this.reqs[leader].prefix
       const first: ConduitReq = this.reqs[leader]
       first.ownRoom(64)
       this.begin(first, first.ownWriter, first.own)
@@ -2100,6 +2213,14 @@ export class ConduitWorker {
           m.solo = true
           this.submit(m, true)
         }
+      }
+      return
+    }
+    if (this.writePrefix[s] > 0) {
+      // The folded favorites' and unfavorites' statements answer no request;
+      // one that fails fails the group, whose writes are then sent alone.
+      if (event === PG_COMPLETE || event === PG_ERROR) {
+        this.writePrefix[s] -= 1
       }
       return
     }
@@ -2243,10 +2364,11 @@ export class ConduitWorker {
       case R_FAVORITE:
       case R_UNFAVORITE:
         ok =
-          conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
-          conn.paramInt(r.viewer) &&
-          this.text(conn, r, F_PATH) &&
-          conn.bindEnd() &&
+          (r.folded ||
+            (conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
+              conn.paramInt(r.viewer) &&
+              this.text(conn, r, F_PATH) &&
+              conn.bindEnd())) &&
           conn.bindStart("article_slug") &&
           conn.paramInt(r.viewer) &&
           this.text(conn, r, F_PATH) &&
@@ -2357,7 +2479,8 @@ export class ConduitWorker {
         break
       case R_FAVORITE:
       case R_UNFAVORITE:
-        if (r.stmt === 1) {
+        // Folded, the article read is its first statement: the write was its batch's.
+        if (r.stmt === (r.folded ? 0 : 1)) {
           this.mainArticle(r, w, conn)
         }
         break

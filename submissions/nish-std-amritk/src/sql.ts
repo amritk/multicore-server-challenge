@@ -245,6 +245,22 @@ export const registerStatements = (pool: PgPool): boolean => {
       "DELETE FROM favorites f USING articles a WHERE f.user_id = $1 AND f.article_id = a.id AND a.slug = $2",
       none
     ) && ok
+  // A write batch's favorites and unfavorites, each kind one statement over
+  // the batch's (viewer, slug) pairs; each request then reads its article.
+  ok =
+    pool.register(
+      "favorite_many",
+      "INSERT INTO favorites (user_id, article_id) SELECT q.v, a.id FROM unnest($1::int8[], $2::text[]) q(v, slug) " +
+        "JOIN articles a ON a.slug = q.slug ON CONFLICT DO NOTHING",
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "unfavorite_many",
+      "DELETE FROM favorites f USING unnest($1::int8[], $2::text[]) q(v, slug), articles a " +
+        "WHERE a.slug = q.slug AND f.user_id = q.v AND f.article_id = a.id",
+      none
+    ) && ok
   // Comments: the article and its newest comments in one statement, one row
   // with the comment columns NULL when it has none, and no row when the
   // article does not exist.
