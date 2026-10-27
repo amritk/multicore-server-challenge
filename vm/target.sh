@@ -23,6 +23,9 @@ fetch() {
 }
 
 setup() {
+  # Everything setup prints is kept, so a step that fails can be read again.
+  exec > >(tee -a /root/target-setup.log) 2>&1
+  trap 'echo "[target] setup FAILED at line $LINENO (log: /root/target-setup.log)"' ERR
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q && apt-get install -y -q git curl python3 openssl
   fetch
@@ -59,6 +62,12 @@ deploy() {
   local sub=nish-std-amritk
   if [ $# -gt 0 ] && [[ "$1" != *=* ]]; then sub="$1"; shift; fi
   fetch
+  if [ ! -s "$SECRET_FILE" ] ||
+    ! runuser -u postgres -- psql -tAXc "SELECT 1 FROM pg_database WHERE datname = 'conduit_seed'" | grep -q 1; then
+    echo "the target is not set up (no $SECRET_FILE or no conduit_seed database):" >&2
+    echo "run 'bash /opt/mcsc/vm/target.sh setup' and check /root/target-setup.log" >&2
+    exit 1
+  fi
   local commit
   commit="$(git -C "$DIR" rev-parse --verify -q "origin/$rev^{commit}" || git -C "$DIR" rev-parse --verify "$rev^{commit}")"
   local short="${commit:0:7}"
