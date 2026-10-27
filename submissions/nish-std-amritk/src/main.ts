@@ -13,9 +13,10 @@
 // Configured by the environment only: DATABASE_URL, JWT_SECRET, HOST, PORT
 // (the challenge's), and optionally HTTP_WORKERS (2), DB_READ_CONNS (3) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
-// for the read connections, DB_READ_BATCHES (DB_READ_CONNS) coalesced reads of
-// one shape in flight per worker, BCRYPT_BATCH_MS (160), BCRYPT_PORT (47391)
-// and IDLE_TIMEOUT_MS (75000).
+// for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
+// per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
+// READ_PLAN_CLOCK (1) for when a plan starts (worker.ts, `planWaitLeft`),
+// BCRYPT_BATCH_MS (160), BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
 import { tcpListenFlags } from "nish:net"
 import { getenv } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
@@ -95,7 +96,10 @@ export const main = (): i32 => {
   cfg.writeConns = envInt("DB_WRITE_CONNS", 1)
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
-  cfg.readBatches = envInt("DB_READ_BATCHES", cfg.readConns)
+  cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
+  cfg.planMin = envInt("READ_PLAN_MIN", 256)
+  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
+  cfg.planClock = (getenv("READ_PLAN_CLOCK") ?? "1") !== "0"
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
   const http: i32 = envInt("HTTP_WORKERS", 2)

@@ -8,6 +8,12 @@
 // serves them all. Each group is one implicit transaction, committed at its
 // Sync, and a response is sent only after its group's ReadyForQuery.
 //
+// The read plans' statements (`registerPlanStatements`, `planArticleBatch`,
+// `planCommentBatch`) answer the same reads for many requests at once, over
+// arrays of their distinct keys: the same rows, split into what finds a
+// page (its ids) and what describes an article (its columns, once a plan).
+// The statements above still answer a read sent alone.
+//
 // Copyright (c) 2026 arjaythedev and the challenge contributors. MIT License;
 // see LICENSE.md beside this file.
 import { PG_BATCH_TEXT, PgBatchConfig, PgPool } from "nish/net/postgres"
@@ -51,13 +57,6 @@ const ARTICLE_LIST: string = LIST_FAVORITED + "$1" + LIST_FOLLOWING + "$1" + LIS
 /** SPEC.md's ARTICLE_FULL_SELECT: the list's columns and `a.body` last. */
 const ARTICLE_FULL: string = ARTICLE_LIST + ", a.body"
 const ARTICLE_FROM: string = " FROM articles a JOIN users u ON u.id = a.author_id"
-/**
- * A coalesced read's key, `q.key` in a `PgBatcher`'s select: the viewer in
- * decimal, a space, and the slug, one text key for the pair, as the batcher
- * takes one key a request.
- */
-const KEY_FROM: string =
-  " FROM (SELECT split_part(q.key, ' ', 1)::int8 AS viewer, substr(q.key, strpos(q.key, ' ') + 1) AS slug) k"
 const SLUGIFY_2: string = "trim(both '-' from lower(regexp_replace($2::text, '[^A-Za-z0-9]+', '-', 'g')))"
 // A scalar subquery, so the volatile currval is read once and the primary key
 // is probed with it, rather than tested against every row.
@@ -277,59 +276,169 @@ export const registerStatements = (pool: PgPool): boolean => {
   return ok
 }
 
-/**
- * The batcher of article reads by slug: one execution answers many requests'
- * `GET /api/articles/:slug`, each distinct key (viewer and slug) once, in
- * `COL_` order with `a.body` last. A slug that matches nothing has no row, so
- * its request alone answers 404. Coalescing waiting reads into one statement
- * over arrays, routed back by ordinal, is an idea from the challenge's
- * rust-tokio-Scooter1337 submission; the SQL is written here.
- */
-export const articleBatch = (maxRequests: i32, runs: i32): PgBatchConfig =>
-  batchConfig(
-    "article_slugs",
-    LIST_FAVORITED +
-      "k.viewer" +
-      LIST_FOLLOWING +
-      "k.viewer" +
-      LIST_END +
-      ", a.body" +
-      KEY_FROM +
-      " JOIN articles a ON a.slug = k.slug JOIN users u ON u.id = a.author_id",
-    "",
-    maxRequests,
-    runs
-  )
+// ---- Read plans (plan.ts) ---------------------------------------------------------
 
 /**
- * The batcher of comment reads by slug, as `articleBatch` is of articles: the
- * article and its newest comments, one row with the comment columns NULL when
+ * A plan's list page, from `q.lim` and `q.off` and the ids `pageIds` selects
+ * (with `author` beside each `id`): its article ids and their authors, newest
+ * first, as two arrays.
+ */
+const planPage = (pageIds: string): string =>
+  "CROSS JOIN LATERAL (SELECT array_agg(p.id ORDER BY p.id DESC) AS ids, array_agg(p.author ORDER BY p.id DESC) AS authors FROM (" +
+  pageIds +
+  ") p) x"
+
+/**
+ * A plan's statement for one kind of list: a row (-k, count) for each count
+ * key `k` of `$1`, and a row (k, NULL, ids, authors) for each page key `k`
+ * of the parallel arrays `$2` (the key), `$3` (limits) and `$4` (offsets).
+ * `keyJoin` finds the key's row (`t` or `u`, NULL when there is none),
+ * `count` the capped count over it, and `pageIds` the page.
+ */
+const planList = (keyType: string, keyJoin: string, count: string, pageIds: string): string =>
+  "SELECT -q.k, (SELECT count(*) FROM (" +
+  count +
+  " LIMIT 1000) s), NULL::int8[], NULL::int8[] FROM unnest($1::" +
+  keyType +
+  "[]) WITH ORDINALITY q(key, k) " +
+  keyJoin +
+  " UNION ALL SELECT q.k, NULL::int8, x.ids, x.authors FROM unnest($2::" +
+  keyType +
+  "[], $3::int8[], $4::int8[]) WITH ORDINALITY q(key, lim, off, k) " +
+  keyJoin +
+  " " +
+  planPage(pageIds)
+
+/** Registers the plans' statements on `pool`; false when the pool refused one. */
+export const registerPlanStatements = (pool: PgPool): boolean => {
+  const none: i32[] = []
+  let ok: boolean = true
+  // The global count walks the primary key from the oldest end, whose pages
+  // are all visible, so it stays an index-only scan while new articles keep
+  // the newest pages busy: an idea from the challenge's
+  // rust-epoll-WorriedArrow submission. It is min(articles, 1000), as
+  // SPEC.md's count is.
+  ok =
+    pool.register(
+      "plan_global",
+      "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), NULL::int8[], NULL::int8[] " +
+        "UNION ALL SELECT q.k, NULL::int8, x.ids, x.authors FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY q(lim, off, k) " +
+        planPage("SELECT a.id, a.author_id AS author FROM articles a ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"),
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "plan_tag",
+      planList(
+        "text",
+        "LEFT JOIN tags t ON t.name = q.key",
+        "SELECT 1 FROM article_tags at WHERE at.tag_id = t.id",
+        "SELECT a.id, a.author_id AS author FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id " +
+          "ORDER BY at.article_id DESC LIMIT q.lim OFFSET q.off) i JOIN articles a ON a.id = i.article_id"
+      ),
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "plan_author",
+      planList(
+        "text",
+        "LEFT JOIN users u ON u.username = q.key",
+        "SELECT 1 FROM articles a WHERE a.author_id = u.id",
+        "SELECT a.id, a.author_id AS author FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"
+      ),
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "plan_favorited",
+      planList(
+        "text",
+        "LEFT JOIN users u ON u.username = q.key",
+        "SELECT 1 FROM favorites f WHERE f.user_id = u.id",
+        "SELECT a.id, a.author_id AS author FROM (SELECT f.article_id FROM favorites f WHERE f.user_id = u.id " +
+          "ORDER BY f.article_id DESC LIMIT q.lim OFFSET q.off) i JOIN articles a ON a.id = i.article_id"
+      ),
+      none
+    ) && ok
+  // A feed's page reads at most limit + offset of each followee's newest ids
+  // from articles_author_idx, as SPEC.md's does, and the followee is the author.
+  ok =
+    pool.register(
+      "plan_feed",
+      planList(
+        "int8",
+        "",
+        "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.key)",
+        "SELECT y.id, fo.followee_id AS author FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
+          "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (q.lim::int + q.off::int)) y " +
+          "WHERE fo.follower_id = q.key ORDER BY y.id DESC LIMIT q.lim OFFSET q.off"
+      ),
+      none
+    ) && ok
+  // Every tag by name, once a plan: the tag list's answer, and the names, in
+  // order, of the tags of every article the plan writes.
+  ok = pool.register("plan_tags", "SELECT id, name FROM tags ORDER BY name", none) && ok
+  // The articles every list, feed and article page of the plan returned, each
+  // once: ARTICLE_LIST_SELECT's columns but the viewer's two flags, with tag
+  // ids for the tag names, and the body of those an article page shows.
+  ok =
+    pool.register(
+      "plan_meta",
+      "SELECT a.id, a.slug, a.title, a.description, " +
+        "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
+        "a.created_at, a.updated_at, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), u.username, u.bio, u.image, " +
+        "CASE WHEN q.with_body THEN a.body END " +
+        "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id JOIN users u ON u.id = a.author_id",
+      none
+    ) && ok
+  // The flags: (0, viewer, article) for each favorite asked about that
+  // exists, (1, viewer, user) for each follow; each viewer's in one range
+  // scan of the primary key over its ids.
+  ok =
+    pool.register(
+      "plan_flags",
+      "SELECT 0::int8, g.v, f.article_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($1::int8[], $2::int8[]) x(v, id) GROUP BY x.v) g " +
+        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids)) f " +
+        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($3::int8[], $4::int8[]) x(v, id) GROUP BY x.v) g " +
+        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids)) fo",
+      none
+    ) && ok
+  return ok
+}
+
+/** A plan's batcher of articles by slug: each distinct slug's id and author, no row when there is none. */
+export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
+  planBatch("plan_article", "SELECT a.id, a.author_id FROM articles a WHERE a.slug = q.key", "", maxRequests)
+
+/**
+ * A plan's batcher of comments by slug: the article's newest comments, with
+ * their authors' ids and profiles, one row with the comment columns NULL when
  * it has none, and no row when the article does not exist.
  */
-export const commentBatch = (maxRequests: i32, runs: i32): PgBatchConfig =>
-  batchConfig(
-    "comment_slugs",
-    "SELECT a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, " +
-      "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = k.viewer AND fo.followee_id = c.author_id) AS following" +
-      KEY_FROM +
-      " JOIN articles a ON a.slug = k.slug LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id " +
+export const planCommentBatch = (maxRequests: i32): PgBatchConfig =>
+  planBatch(
+    "plan_comments",
+    "SELECT a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image " +
+      "FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id " +
       "FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true " +
-      "LEFT JOIN users u ON u.id = c.author_id",
+      "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = q.key",
     "t.created_at DESC, t.id DESC",
-    maxRequests,
-    runs
+    maxRequests
   )
 
-const batchConfig = (name: string, select: string, orderBy: string, maxRequests: i32, runs: i32): PgBatchConfig => {
+const planBatch = (name: string, select: string, orderBy: string, maxRequests: i32): PgBatchConfig => {
   const c = new PgBatchConfig()
   c.name = name
   c.select = select
   c.orderBy = orderBy
   c.keyType = PG_BATCH_TEXT
   c.maxRequests = maxRequests
-  c.maxBytes = 32768
-  c.queueSize = 65536
-  c.queueBytes = 4194304
-  c.runs = runs
+  // A plan's keys are at most PLAN_KEY_BYTES, each escaped at worst to twice its length.
+  c.maxBytes = 65536
+  c.queueSize = maxRequests
+  c.queueBytes = 65536
+  // One execution a plan; a second run would be a plan's failed take, made again empty.
+  c.runs = 2
   return c
 }
