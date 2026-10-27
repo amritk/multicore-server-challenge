@@ -208,13 +208,15 @@ statements where the build before took about 17,200.
 Ideas taken from other submissions to the challenge, each written here
 from the idea, not the code:
 
-- From [rust-epoll-WorriedArrow](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-WorriedArrow):
+- From [rust-epoll-WorriedArrow](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-WorriedArrow)
+  ([#47](https://github.com/arjaythedev/multicore-server-challenge/pull/47)):
   the batch planner in front of Postgres, in two phases. Pages and capped
   counts answered from one statement per kind of list over distinct keys;
   the union of a batch's articles enriched once; the viewers' flags as one
   `= ANY` range scan per viewer; a batch gathered for a window, the batch
   clock; and the global count walking the primary key from its oldest end.
-- From [rust-tokio-Scooter1337](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-tokio-Scooter1337):
+- From [rust-tokio-Scooter1337](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-tokio-Scooter1337)
+  ([#7](https://github.com/arjaythedev/multicore-server-challenge/pull/7)):
   coalescing waiting reads into one statement over arrays, routed back by
   ordinal, and cutting a list page before computing its articles' metadata.
 
