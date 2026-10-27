@@ -426,7 +426,7 @@ export class ReadPlan {
    */
   add(tag: i32, kind: i32, viewer: i64, limit: i64, offset: i64, src: u8[], start: i32, len: i32): boolean {
     const n: i32 = len > 0 ? len : 0
-    if (this.count >= PLAN_MAX || this.keyEnd + n > PLAN_KEY_BYTES || !this.keyed && this.count > 0) {
+    if (this.count >= PLAN_MAX || this.keyEnd + n > PLAN_KEY_BYTES || (!this.keyed && this.count > 0)) {
       return false
     }
     this.keyed = true
@@ -479,7 +479,11 @@ export class ReadPlan {
     if (kind !== this.kinds[b]) {
       return false
     }
-    if (page && kind < LIST_KINDS && (this.limits[a] !== this.limits[b] || this.offsets[a] !== this.offsets[b])) {
+    if (
+      page &&
+      kind < LIST_KINDS &&
+      (this.limits[a] !== this.limits[b] || this.offsets[a] !== this.offsets[b])
+    ) {
       return false
     }
     if (kind === K_FEED) {
@@ -1030,7 +1034,9 @@ export class ReadPlan {
   }
 
   private stringOrNull(out: u8[], o: i32, conn: PgConnection, b: u8[], c: i32): i32 {
-    return conn.isNull(c) ? jsonOutNull(out, o) : jsonOutString(out, o, b, conn.colStart(c), conn.colLength(c))
+    return conn.isNull(c)
+      ? jsonOutNull(out, o)
+      : jsonOutString(out, o, b, conn.colStart(c), conn.colLength(c))
   }
 
   /** The `timestamptz` column `c` as RFC 3339 with milliseconds (no quotes), or `failed` when it does not read. */
@@ -1085,7 +1091,11 @@ export class ReadPlan {
     this.stmtCount = 0
     this.stmtDone = 0
     if (this.metas > 0) {
-      if (!conn.bindStart("plan_meta") || !conn.paramIntArray(this.metaIds, 0, this.metas) || !conn.arrayStart()) {
+      if (
+        !conn.bindStart("plan_meta") ||
+        !conn.paramIntArray(this.metaIds, 0, this.metas) ||
+        !conn.arrayStart()
+      ) {
         return false
       }
       for (let k: i32 = 0; k < this.metas; k++) {
@@ -1199,7 +1209,12 @@ export class ReadPlan {
     const out: u8[] = this.text
     const b: u8[] = conn.inputBuffer()
     const f: u8[][] = this.f
-    if (conn.isNull(M_SLUG) || conn.isNull(M_TITLE) || conn.isNull(M_DESCRIPTION) || conn.isNull(M_USERNAME)) {
+    if (
+      conn.isNull(M_SLUG) ||
+      conn.isNull(M_TITLE) ||
+      conn.isNull(M_DESCRIPTION) ||
+      conn.isNull(M_USERNAME)
+    ) {
       this.failed = true
       return
     }
@@ -1346,7 +1361,9 @@ export class ReadPlan {
     if (v === 0) {
       return false
     }
-    return this.flagTable[this.pairSlot(this.flagTable, this.flagV, this.flagId, this.flagKind, v, id, kind)] > 0
+    return (
+      this.flagTable[this.pairSlot(this.flagTable, this.flagV, this.flagId, this.flagKind, v, id, kind)] > 0
+    )
   }
 
   // ---- Answers --------------------------------------------------------------------

@@ -323,7 +323,9 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
       "plan_global",
       "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), NULL::int8[], NULL::int8[] " +
         "UNION ALL SELECT q.k, NULL::int8, x.ids, x.authors FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY q(lim, off, k) " +
-        planPage("SELECT a.id, a.author_id AS author FROM articles a ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"),
+        planPage(
+          "SELECT a.id, a.author_id AS author FROM articles a ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"
+        ),
       none
     ) && ok
   ok =
