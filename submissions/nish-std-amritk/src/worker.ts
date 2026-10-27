@@ -752,6 +752,7 @@ export class ConduitWorker {
   /** Serves until the process is stopped; answers 1 when the loop fails. */
   run(): i32 {
     const ready: i32[] = new Array<i32>(2 * 512)
+    this.bcryptStart()
     while (true) {
       this.pump()
       let wait: i32 = 1000
@@ -2905,21 +2906,35 @@ export class ConduitWorker {
    * Postgres keeps every core busy, where one alone fell behind the logins.
    */
   bcryptPick(): i32 {
-    let best: i32 = 0
-    let bestPart: i32 = -1
-    let idle: i32 = 0
+    let up: boolean = false
+    for (const c of this.bcrypts) {
+      up = up || !c.down
+    }
+    let best: i32 = -1
+    let bestPart: i32 = 0
+    let idle: i32 = -1
     for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
-      const n: i32 = this.bcrypts[k].inFlight
-      const part: i32 = n % BCRYPT_LANES
+      const c: BcryptClient = this.bcrypts[k]
+      if (up && c.down) {
+        continue
+      }
+      const part: i32 = c.inFlight % BCRYPT_LANES
       if (part > bestPart) {
         bestPart = part
         best = k
       }
-      if (n < this.bcrypts[idle].inFlight) {
+      if (idle < 0 || c.inFlight < this.bcrypts[idle].inFlight) {
         idle = k
       }
     }
-    return bestPart > 0 ? best : idle
+    return best >= 0 ? best : idle
+  }
+
+  /** Connects to every bcrypt service at start, so one that is not there is known down before a login needs it. */
+  bcryptStart(): void {
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      this.bcryptConnect(k)
+    }
   }
 
   /** Sends `r`'s password to a bcrypt service: a new hash, or a check against `F_HASH`. */
@@ -2972,13 +2987,19 @@ export class ConduitWorker {
   bcryptRefused(k: i32): void {
     const c: BcryptClient = this.bcrypts[k]
     const now: i64 = monotonicNanos()
+    if (c.down) {
+      // Tried again once a second; its jobs went to the others meanwhile.
+      c.retryAt = now + 1000000000
+      return
+    }
     if (c.failedAt === 0) {
       c.failedAt = now
     }
     if (now - c.failedAt > BCRYPT_PATIENCE) {
       c.failedAt = 0
-      c.retryAt = 0
       this.bcryptLost(k)
+      c.down = true
+      c.retryAt = now + 1000000000
       return
     }
     c.retryAt = now + 50000000
@@ -3027,6 +3048,7 @@ export class ConduitWorker {
       }
       c.connected = true
       c.failedAt = 0
+      c.down = false
     }
     if ((events & READABLE) !== 0) {
       if (!c.receive()) {

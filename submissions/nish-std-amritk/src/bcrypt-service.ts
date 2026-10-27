@@ -488,6 +488,8 @@ export class BcryptClient {
   retryAt: i64 = 0
   /** Jobs sent and not yet answered. */
   inFlight: i32 = 0
+  /** Unreachable past the worker's patience: given no jobs while another service is up. */
+  down: boolean = false
 
   constructor() {
     this.address = new Array<u8>(18)
