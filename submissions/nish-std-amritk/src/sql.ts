@@ -413,6 +413,10 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
 export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
   planBatch("plan_article", "SELECT a.id, a.author_id FROM articles a WHERE a.slug = q.key", "", maxRequests)
 
+/** A plan's batcher of profiles by username: the user's id and profile, no row when there is none. */
+export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
+  planBatch("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
+
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with
  * their authors' ids and profiles, one row with the comment columns NULL when

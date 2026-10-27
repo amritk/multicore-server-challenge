@@ -15,7 +15,7 @@
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
 // per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
-// READ_PLAN_CLOCK (1) for when a plan starts (worker.ts, `planWaitLeft`),
+// READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_BATCH_MS (160), BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
 import { tcpListenFlags } from "nish:net"
 import { getenv } from "nish:process"
@@ -99,7 +99,9 @@ export const main = (): i32 => {
   cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
   cfg.planMin = envInt("READ_PLAN_MIN", 256)
   cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
-  cfg.planClock = (getenv("READ_PLAN_CLOCK") ?? "1") !== "0"
+  const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
+  cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
+  cfg.planLight = envInt("READ_PLAN_LIGHT", 32)
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
   const http: i32 = envInt("HTTP_WORKERS", 2)

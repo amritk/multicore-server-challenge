@@ -103,6 +103,7 @@ import {
   K_FAVORITED,
   K_FEED,
   K_GLOBAL,
+  K_PROFILE,
   K_TAG,
   K_TAGS,
   PLAN_ALONE,
@@ -517,7 +518,9 @@ export class WorkerConfig {
    */
   planMin: i32 = 256
   planWaitUs: i32 = 10000
-  planClock: boolean = true
+  /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
+  planClock: i32 = 1
+  planLight: i32 = 32
   bcryptPort: i32 = 47391
   slots: i32 = 200000
   backlog: i32 = 65535
@@ -603,8 +606,13 @@ export class ConduitWorker {
   planAt: i64[]
   planMin: i32 = 256
   planWait: i64 = 0
-  /** Whether the window gathers reads even while no plan runs: a batch clock. */
-  planClock: boolean = true
+  /** Whether the window gathers reads even while no plan runs: a batch clock (`WorkerConfig.planClock`). */
+  planClock: i32 = 1
+  planLight: i64 = 32
+  /** Reads that came for plans since `rateAt`, and how many came a window over the last measure. */
+  arrivals: i64 = 0
+  rateAt: i64 = 0
+  perWindow: i64 = 0
 
   constructor(cfg: WorkerConfig, listener: i32) {
     this.listener = listener
@@ -708,11 +716,13 @@ export class ConduitWorker {
     const noTypes: i32[] = []
     this.pools[POOL_READ].register(this.plans[0].articles.name, this.plans[0].articles.sql, noTypes)
     this.pools[POOL_READ].register(this.plans[0].comments.name, this.plans[0].comments.sql, noTypes)
+    this.pools[POOL_READ].register(this.plans[0].profiles.name, this.plans[0].profiles.sql, noTypes)
     this.planRing = new Array<i32>(QUEUE)
     this.planAt = new Array<i64>(QUEUE)
     this.planMin = cfg.planMin
     this.planWait = toI64(cfg.planWaitUs) * 1000
     this.planClock = cfg.planClock
+    this.planLight = toI64(cfg.planLight)
     this.ticketPlan = new Array<i32>(TICKET_RING)
     for (let k: i32 = 0; k < TICKET_RING; k++) {
       this.ticketPlan[k] = -1
@@ -1479,8 +1489,10 @@ export class ConduitWorker {
       }
       const at: i32 = (this.planHead + this.planCount) % QUEUE
       this.planRing[at] = r.index
-      this.planAt[at] = monotonicNanos()
+      const now: i64 = monotonicNanos()
+      this.planAt[at] = now
       this.planCount += 1
+      this.arrived(now)
       return
     }
     const ticket: i32 = this.pools[p].request()
@@ -1512,6 +1524,9 @@ export class ConduitWorker {
       return K_TAGS
     } else if (r.route === R_ARTICLE_GET || r.route === R_COMMENTS) {
       kind = r.route === R_ARTICLE_GET ? K_ARTICLE : K_COMMENTS
+      f = F_PATH
+    } else if (r.route === R_PROFILE) {
+      kind = K_PROFILE
       f = F_PATH
     } else {
       return -1
@@ -1547,7 +1562,7 @@ export class ConduitWorker {
       while (this.planCount > 0) {
         const r: ConduitReq = this.reqs[this.planRing[this.planHead]]
         const kind: i32 = this.planKind(r)
-        const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS ? F_PATH : F_FILTER
+        const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE ? F_PATH : F_FILTER
         if (!plan.add(r.index, kind, r.viewer, r.limit, r.offset, r.text, r.fStart[f], r.fLen[f])) {
           break
         }
@@ -1571,7 +1586,13 @@ export class ConduitWorker {
     if (this.planCount === 0 || this.planCount >= this.planMin) {
       return 0
     }
-    let busy: boolean = this.planClock
+    // An adaptive clock gathers only while enough reads come to fill a plan
+    // worth the wait; a quiet worker (or one quiet for 50 ms) starts at once.
+    let busy: boolean =
+      this.planClock === 1 ||
+      (this.planClock === 2 &&
+        this.perWindow >= this.planLight &&
+        monotonicNanos() - this.rateAt < toI64(2) * this.measureSpan())
     for (let p: i32 = 0; p < toI32(this.planState.length); p++) {
       busy = busy || this.planState[p] !== PLAN_FREE
     }
@@ -1580,6 +1601,27 @@ export class ConduitWorker {
     }
     const left: i64 = this.planAt[this.planHead] + this.planWait - monotonicNanos()
     return left > 0 ? left : 0
+  }
+
+  /**
+   * Counts a read that came for a plan, and every 50 ms (or a window, when
+   * longer) measures how many come a window: what an adaptive clock
+   * (`planClock` 2) gathers by.
+   */
+  arrived(now: i64): void {
+    this.arrivals += 1
+    const span: i64 = now - this.rateAt
+    if (span >= this.measureSpan()) {
+      this.perWindow = span > 0 ? (this.arrivals * this.planWait) / span : 0
+      this.arrivals = 0
+      this.rateAt = now
+    }
+  }
+
+  /** How long the arrival rate is measured over, in ns: 50 ms, or a window when longer. */
+  measureSpan(): i64 {
+    const floor: i64 = 50000000
+    return this.planWait > floor ? this.planWait : floor
   }
 
   /** Plan `p`'s group ended: after group A, asks for group B when it has anything to read, else answers. */
