@@ -42,7 +42,8 @@ setup() {
   say "the full seed (conduit_seed, ~2.4 GB; 5-10 minutes)"
   chown -R postgres: "$DIR/seed"
   if ! runuser -u postgres -- psql -tAXc "SELECT 1 FROM pg_database WHERE datname = 'conduit_seed'" | grep -q 1; then
-    runuser -u postgres -- env PATH="/usr/local/go/bin:$PATH" HOME=/var/lib/postgresql bash "$DIR/seed/make-seed.sh"
+    runuser -u postgres -- env PATH="/usr/local/go/bin:$PATH" HOME=/var/lib/postgresql GOFLAGS=-buildvcs=false \
+      bash "$DIR/seed/make-seed.sh"
   fi
 
   [ -s "$SECRET_FILE" ] || (umask 077 && openssl rand -hex 32 > "$SECRET_FILE")
