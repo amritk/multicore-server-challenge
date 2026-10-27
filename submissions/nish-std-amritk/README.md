@@ -162,6 +162,22 @@ quarter of its p95.
 | before | 12,609–12,641 | 204–216 ms | 338–339 ms | 0 | 185–186 µs | 59–60 µs | 0.78 |
 | after | 14,674–14,756 | 54–60 ms | 71–83 ms | 0 | 113–116 µs | 56–58 µs | 0.24 |
 
+The most users each holds, stepping up 1,000 at a time (30 s ramp, 60 s
+measured, the challenge's pass rule: p95 < 500 ms, p99 < 1 s, errors < 1%):
+
+| Users | Before | After |
+| ---: | --- | --- |
+| 6,000 | pass, 12,265 req/s, p95 246 ms | pass, 14,640 req/s, p95 62 ms |
+| 7,000 | **fail**, 12,116 req/s, p95 562 ms | pass, 16,348 req/s, p95 102 ms |
+| 8,000 | | pass, 17,791 req/s, p95 136 ms |
+| 9,000 | | pass, 18,704 req/s, p95 188 ms |
+| 10,000 | | pass, 19,468 req/s, p95 236 ms |
+
+The build before holds 6,000 and fails at 7,000; the read plans hold
+10,000, the most tried, at about 100 µs of Postgres CPU a request. At 1,000
+users, far from any limit, the batch clock shows: p95 is 14.5 ms against
+1.7 ms before, and Postgres CPU per request 192 µs against 326 µs.
+
 Each step, on the same load, by Postgres CPU per request (the spread of
 two or three pairs against its own control):
 
