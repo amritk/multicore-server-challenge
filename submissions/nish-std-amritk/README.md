@@ -27,11 +27,12 @@ the compiler and its platform package.
 
 ## Design and optimizations
 
-- **Processes.** A prefork parent starts two HTTP workers and one bcrypt
-  service, and restarts none of them. Each HTTP worker binds `HOST:PORT` with
-  `SO_REUSEPORT` and `TCP_NODELAY`, and runs one epoll loop over its
-  listener, its keep-alive connections, its PostgreSQL connections and its
-  connection to the bcrypt service. Nothing is shared between workers.
+- **Processes.** A prefork parent starts two HTTP workers and the bcrypt
+  services (half the CPUs, at least two: four on the box), and restarts none
+  of them. Each HTTP worker binds `HOST:PORT` with `SO_REUSEPORT` and
+  `TCP_NODELAY`, and runs one epoll loop over its listener, its keep-alive
+  connections, its PostgreSQL connections and its connection to each bcrypt
+  service. Nothing is shared between workers.
 - **Direct HTTP/1.1** with a sans-IO parser. Request and head buffers are
   lent to a connection while it reads and taken back while it is idle, so an
   idle keep-alive connection costs about 1.1 KiB of server memory. A busy
@@ -46,7 +47,8 @@ the compiler and its platform package.
 - **Read plans.** Postgres is what the challenge's box runs out of, so the
   reads are planned to cost it as little as possible. Every list page (the
   global list, a tag, an author, a user's favorites), every feed, every
-  article and its comments by slug, and the tag list wait together for the
+  article and its comments by slug, every profile by username, and the tag
+  list wait together for the
   worker's next read plan, which answers all of them from a few statements
   over arrays of their distinct keys, in two pipelined groups
   (`src/plan.ts`):
@@ -56,15 +58,16 @@ the compiler and its platform package.
      authors, and every distinct capped count once. Identical requests are
      one page: the global list has five pages a user clicks, and most of a
      plan's global requests read page one. The articles and the comments by
-     slug go through nish's `PgBatcher`, each distinct slug one key of one
-     execution over `unnest($1) WITH ORDINALITY`, its rows routed back by
-     ordinal. Every tag is read once, by name.
+     slug, and the profiles by username, go through nish's `PgBatcher`, each
+     distinct key one key of one execution over `unnest($1) WITH
+     ORDINALITY`, its rows routed back by ordinal. Every tag is read once,
+     by name.
   2. **Group B** reads the rest once for the whole plan: the columns of the
      union of every article group A returned (lists, feeds and article
      pages alike: an article on the first global page, a tag page and an
      article page is read once), and the viewers' `favorited` and
-     `following` flags, each viewer's in one index range scan over its ids
-     (`= ANY(...)`) rather than one probe per article. An article's tags
+     `following` flags (a profile's too), each viewer's in one index range
+     scan over its ids (`= ANY(...)`) rather than one probe per article. An article's tags
      come as ids and are named and ordered from group A's one read of every
      tag.
 
@@ -87,13 +90,20 @@ the compiler and its platform package.
   requests there: it cost about 12 ms of p95 and saved about a fifth of
   Postgres's CPU per request (measured below). The busier the server, the
   sooner a plan fills and the less the window holds a read.
+  `READ_PLAN_CLOCK=2` makes the clock adaptive: a worker that sees fewer
+  than `READ_PLAN_LIGHT` (32) planned reads a window starts a plan at once
+  while none is in flight, and gathers for the window above that, so a
+  quiet server answers in a couple of milliseconds instead of ten.
 - **Durable group commit.** While a batch is in flight on the write
   connection, the writes that arrive wait. Then up to 128 of them go as one
   group: one transaction, one commit, and one WAL flush. Each response is
   sent after that group's ReadyForQuery. No timer holds a write: an idle
   server sends one at once. A failed batch rolled back every write in it, so
   each write is sent again alone. A write whose connection is lost may have
-  committed, so it answers 500 and is never sent again.
+  committed, so it answers 500 and is never sent again. A batch's favorites
+  and unfavorites are one statement of each kind over their (viewer, slug)
+  pairs, and each then reads its article; a viewer with two toggles in one
+  batch keeps its own statements, so its toggles stay in order.
 - **SQL.** A read plan's statements answer what SPEC.md's reference SQL
   answers, request by request (`src/sql.ts`): a page is the same ids in the
   same order, a count the same capped count (the global one walks the
@@ -116,10 +126,17 @@ the compiler and its platform package.
 - **Tokens.** HS256 over an HMAC keyed once with `JWT_SECRET`: each
   signature copies the two keyed states. The signature, algorithm and
   expiry are checked on every request. Nothing is cached between requests.
-- **bcrypt.** Cost 10, with salts from the CSPRNG. One process batches up
-  to four hashes or four checks into one four-lane bcrypt call, after a
-  collection window of up to 160 ms. Passwords are wiped once sent and once
-  hashed.
+- **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
+  batches up to four hashes or four checks into one four-lane bcrypt call,
+  after a collection window of up to 160 ms. A worker sends a login to the
+  service whose batch is closest to full, else the least busy, so batches
+  fill before another service is given work. With Postgres keeping every
+  core busy, one process got a share of a core too small for the logins:
+  at 8,000 users on 4 CPUs (below), login p95 was 1.3 to 1.9 s with one
+  service and 0.5 s with two, and one run with one service timed out a
+  fifth of its logins. A service a worker cannot reach is given no logins
+  while another is up, and is tried again once a second. Passwords are
+  wiped once sent and once hashed.
 
 Every request reads PostgreSQL, and there are no result, token or password
 caches. There are no schema or configuration changes, no CPU affinity and no
@@ -129,8 +146,10 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (2),
 `DB_READ_CONNS` (3) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (`DB_READ_CONNS`) read plans in flight per worker,
 `READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (256) for the batch clock,
-`READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight),
-`BCRYPT_BATCH_MS` (160), `BCRYPT_PORT` (47391, loopback) and
+`READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
+is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
+at least 2), `BCRYPT_BATCH_MS` (160), `BCRYPT_PORT` (47391, loopback; the
+services listen on it and the ports above) and
 `IDLE_TIMEOUT_MS` (75000). That makes 8 PostgreSQL connections in all, inside
 the limit of 95.
 
@@ -203,6 +222,26 @@ shuffled order: every answer matches its serial one byte for byte, and
 every serial answer matches the build before byte for byte, in about 4,600
 statements where the build before took about 17,200.
 
+### Since the first submission (#83, 91,000 users)
+
+Same method and container as above, two runs of each, the build #83 was
+scored at (`3de991e`) against this one, both at their defaults:
+
+| Users | Build | req/s | p95 | Postgres CPU / req | statements / req |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 4,000 | #83 | 10,185–10,232 | 25–26 ms | 123–129 µs | 0.29–0.30 |
+| 4,000 | this | 10,186–10,200 | 25 ms | 119–120 µs | 0.25 |
+| 8,000 | #83 | 18,389–18,564 | 104–107 ms | 100–101 µs | 0.21 |
+| 8,000 | this | 18,201–18,897 | 81–113 ms | 98–103 µs | 0.15 |
+
+Profiles in the read plans and the folded favorites take a quarter of the
+statements off; what that saves Postgres is within the spread between runs
+at 8,000 users. The bcrypt services are what changed the logins (above).
+At 1,000 users the adaptive clock (`READ_PLAN_CLOCK=2`) took p95 from 14 ms
+to 2–3 ms, at twice the Postgres CPU per request while the box was idle;
+under load it measured within the spread of the fixed clock, which stays the
+default.
+
 ## Credits
 
 Ideas taken from other submissions to the challenge, each written here
@@ -219,6 +258,17 @@ from the idea, not the code:
   ([#7](https://github.com/arjaythedev/multicore-server-challenge/pull/7)):
   coalescing waiting reads into one statement over arrays, routed back by
   ordinal, and cutting a list page before computing its articles' metadata.
+- From [zig-iouring-harshitkhandelwal208](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/zig-iouring-harshitkhandelwal208)
+  ([#45](https://github.com/arjaythedev/multicore-server-challenge/pull/45)):
+  a batch window that holds reads only while the server is busy (the
+  adaptive clock).
+- From [go-epoll-MegaPanchamZ](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/go-epoll-MegaPanchamZ)
+  ([#61](https://github.com/arjaythedev/multicore-server-challenge/pull/61)):
+  a group commit's writes of one kind as one statement over arrays.
+- From [zig-fourneau-y2kbugger](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/zig-fourneau-y2kbugger)
+  ([#53](https://github.com/arjaythedev/multicore-server-challenge/pull/53)):
+  more bcrypt workers than one core's worth, because a saturated box gives
+  each only a fair share.
 
 The source lives here; until Nish 0.23.0 it was staged from
 [`bench/multicore/conduit`](https://github.com/amritk/nish/tree/c434ac7b/bench/multicore/conduit)
