@@ -63,6 +63,10 @@ import {
 import {
   PG_ARRAY_ELEMENT,
   PG_ARRAY_NULL,
+  PG_BATCH_DONE,
+  PG_BATCH_MISSING,
+  PG_BATCH_NONE,
+  PG_BATCH_ROW,
   PG_COMPLETE,
   PG_ERROR,
   PG_FAILED,
@@ -72,6 +76,7 @@ import {
   PG_POOL_FULL,
   PG_ROW,
   PgArrayWalker,
+  PgBatcher,
   PgConfig,
   PgConnection,
   PgPool,
@@ -101,13 +106,13 @@ import {
   COL_FAVORITES,
   COL_FOLLOWING,
   COL_IMAGE,
-  COL_ORD,
   COL_SLUG,
   COL_TAGS,
   COL_TITLE,
   COL_UPDATED,
   COL_USERNAME,
-  COMMENT_ORD,
+  articleBatch,
+  commentBatch,
   registerStatements,
 } from "./sql"
 
@@ -191,7 +196,9 @@ const QUEUE: i32 = 65536
 const WRITE_BATCH: i32 = 128
 /**
  * The read shapes coalesced: requests of one shape waiting together run as
- * one statement over arrays. `SHAPE_NONE` is every other request.
+ * one statement. `SHAPE_NONE` is every other request. An article or its
+ * comments by slug goes through that shape's `PgBatcher`, one execution over
+ * an array of keys.
  */
 const SHAPE_NONE: i32 = -1
 const SHAPE_ARTICLE: i32 = 0
@@ -199,13 +206,13 @@ const SHAPE_COMMENTS: i32 = 1
 /** `GET /api/tags`: every request waiting takes the one row of one execution. */
 const SHAPE_TAGS: i32 = 2
 const SHAPES: i32 = 3
-/** The most requests one coalesced read takes, and the most bytes its arrays may take. */
+/** The shapes that go through a `PgBatcher`, `SHAPE_ARTICLE` up to this one. */
+const BATCHED_SHAPES: i32 = 2
+/** The most requests one coalesced read takes, and the most bytes its key array may take. */
 const READ_BATCH: i32 = 32
 const READ_BATCH_BYTES: i32 = 32768
-/** The statement a coalesced read of `shape` runs for more than one request. */
-const shapeStatement = (shape: i32): string => (shape === SHAPE_ARTICLE ? "article_slugs" : "comment_slugs")
-/** The column of a coalesced read of `shape` that holds the row's request's place. */
-const shapeOrd = (shape: i32): i32 => (shape === SHAPE_ARTICLE ? COL_ORD : COMMENT_ORD)
+/** The most executions of one batcher in flight, `PgBatchConfig.runs`. */
+const BATCH_RUNS: i32 = 16
 /**
  * The most bytes a batch's binds may take, half of `PG_MAX_OUTPUT`. One
  * write's binds take at most twice its text (tags are bound twice) and 512
@@ -222,10 +229,54 @@ const BCRYPT_PATIENCE: i64 = 5000000000
 /** At most the bytes `r`'s binds take: twice its text (tags are bound twice) and 512. */
 const writeCost = (r: ConduitReq): i32 => 2 * r.textEnd + 512
 /**
- * At most the bytes `r` adds to a coalesced read's arrays: its slug quoted,
- * every byte escaped, and a comma; its viewer in decimal and a comma.
+ * At most the bytes `r`'s key adds to a coalesced read's array: its viewer
+ * in decimal, a space and its slug, quoted, every byte escaped, and a comma.
  */
-const readCost = (r: ConduitReq): i32 => 2 * r.fLen[F_PATH] + 3 + 21
+const readCost = (r: ConduitReq): i32 => 2 * (r.fLen[F_PATH] + 21) + 3
+
+/** Whether `b[start, end)` is UTF-8 with no NUL: a text a batcher takes as a key, and Postgres as text. */
+const isText = (b: u8[], start: i32, end: i32): boolean => {
+  let k: i32 = start
+  while (k < end && k < toI32(b.length)) {
+    const c: i32 = toI32(b[k])
+    if (c === 0) {
+      return false
+    }
+    if (c < 128) {
+      k++
+      continue
+    }
+    // The sequence's length, and the bounds of its second byte, which rule
+    // out overlong forms, surrogates and code points past U+10FFFF.
+    let n: i32 = 0
+    let lo: i32 = 128
+    let hi: i32 = 191
+    if (c >= 194 && c <= 223) {
+      n = 1
+    } else if (c >= 224 && c <= 239) {
+      n = 2
+      lo = c === 224 ? 160 : 128
+      hi = c === 237 ? 159 : 191
+    } else if (c >= 240 && c <= 244) {
+      n = 3
+      lo = c === 240 ? 144 : 128
+      hi = c === 244 ? 143 : 191
+    } else {
+      return false
+    }
+    if (n > end - k - 1) {
+      return false
+    }
+    for (let j: i32 = 1; j <= n; j++) {
+      const d: i32 = toI32(b[k + j])
+      if (d < (j === 1 ? lo : 128) || d > (j === 1 ? hi : 191)) {
+        return false
+      }
+    }
+    k += n + 1
+  }
+  return true
+}
 
 /** One request in progress: its route, its parameters, and where its answer stands. */
 class ConduitReq {
@@ -339,6 +390,27 @@ class ConduitReq {
       this.own = new Array<u8>(size)
     }
     this.ownWriter.reset(this.own, 0)
+  }
+
+  /**
+   * Makes `own` hold `n` more bytes past what `ownWriter` has written,
+   * keeping them: a coalesced read's answer grows row by row.
+   */
+  ownGrow(n: i32): void {
+    const w: JsonWriter = this.ownWriter
+    if (w.end + n <= toI32(this.own.length)) {
+      return
+    }
+    let size: i32 = toI32(this.own.length) < 4096 ? 4096 : toI32(this.own.length)
+    while (size < w.end + n) {
+      size = size * 2
+    }
+    const grown: u8[] = new Array<u8>(size)
+    for (let k: i32 = 0; k < w.end && k < toI32(this.own.length); k++) {
+      grown[k] = this.own[k]
+    }
+    this.own = grown
+    w.buf = grown
   }
 
   /** Makes room for `n` more bytes of `text`. */
@@ -551,19 +623,29 @@ export class ConduitWorker {
   readBatches: i32[]
   readLimit: i32 = 1
   /**
-   * Per read-pool slot, for the coalesced read it is answering: its shape
-   * (`SHAPE_NONE` while it answers another group), the request whose rows
-   * come next and that request's place in the batch, whether the batch is
-   * one request bound with its own statement, and whether a statement failed.
+   * Per read-pool slot, for the tags read it is answering: its shape
+   * (`SHAPE_NONE` while it answers another group), the request answered
+   * next, whether the read is one request, and whether its statement failed.
    */
   readShape: i32[]
   readCursor: i32[]
-  readPos: i32[]
   readAlone: boolean[]
   readError: boolean[]
-  /** Where a coalesced read's array parameters are written, and the writer of its viewers. */
-  arrayBuf: u8[]
-  arrayWriter: JsonWriter
+  /** Per batched shape: its batcher, and how many of its executions the read pool has, asked for or in flight. */
+  batchers: PgBatcher[]
+  batchFlight: i32[]
+  /** Per batched shape: its executions asked for and not yet dispatched. */
+  batchAsked: i32[]
+  /**
+   * Per read-pool ticket, by `ticket % TICKET_RING`: the batched shape whose
+   * execution it is (`SHAPE_NONE` for any other), the run `take` answered,
+   * and whether the run has had its `end` or `fail`.
+   */
+  ticketShape: i32[]
+  ticketRun: i32[]
+  ticketEnded: boolean[]
+  /** Where a batched read's key is put together before the batcher copies it. */
+  keyBuf: u8[]
 
   constructor(cfg: WorkerConfig, listener: i32) {
     this.listener = listener
@@ -670,15 +752,33 @@ export class ConduitWorker {
     const reads: i32 = this.pools[POOL_READ].size
     this.readShape = new Array<i32>(reads)
     this.readCursor = new Array<i32>(reads)
-    this.readPos = new Array<i32>(reads)
     this.readAlone = new Array<boolean>(reads)
     this.readError = new Array<boolean>(reads)
     for (let k: i32 = 0; k < reads; k++) {
       this.readShape[k] = SHAPE_NONE
       this.readCursor[k] = -1
     }
-    this.arrayBuf = new Array<u8>(READ_BATCH_BYTES)
-    this.arrayWriter = new JsonWriter(this.arrayBuf, 0)
+    if (this.readLimit > BATCH_RUNS) {
+      this.readLimit = BATCH_RUNS
+    }
+    this.batchers = [
+      new PgBatcher(articleBatch(READ_BATCH, BATCH_RUNS)),
+      new PgBatcher(commentBatch(READ_BATCH, BATCH_RUNS)),
+    ]
+    this.batchFlight = [0, 0]
+    this.batchAsked = [0, 0]
+    const noTypes: i32[] = []
+    for (const b of this.batchers) {
+      this.pools[POOL_READ].register(b.name, b.sql, noTypes)
+    }
+    this.ticketShape = new Array<i32>(TICKET_RING)
+    this.ticketRun = new Array<i32>(TICKET_RING)
+    this.ticketEnded = new Array<boolean>(TICKET_RING)
+    for (let k: i32 = 0; k < TICKET_RING; k++) {
+      this.ticketShape[k] = SHAPE_NONE
+      this.ticketRun[k] = -1
+    }
+    this.keyBuf = new Array<u8>(READ_BATCH_BYTES)
     netAddress(this.bcryptAddress, "127.0.0.1", cfg.bcryptPort)
   }
 
@@ -1425,7 +1525,27 @@ export class ConduitWorker {
       this.writeCount += 1
       return
     }
-    const shape: i32 = p === POOL_READ && !r.solo ? this.shapeOf(r) : SHAPE_NONE
+    let shape: i32 = p === POOL_READ && !r.solo ? this.shapeOf(r) : SHAPE_NONE
+    if (shape >= 0 && shape < BATCHED_SHAPES) {
+      // Reads of a batched shape wait in its batcher: `batchReads` asks the
+      // pool for an execution, and `take` binds them when it comes.
+      this.wait(r, p)
+      r.shape = shape
+      const added: i32 = this.addBatched(r, shape)
+      if (added > 0) {
+        r.ownRoom(4096)
+        this.begin(r, r.ownWriter, r.own)
+        return
+      }
+      r.inPool = false
+      if (added === 0) {
+        r.shape = SHAPE_NONE
+        this.fail(r, 503, "busy", later)
+        return
+      }
+      // A key Postgres would refuse goes alone, where it answers its own error.
+      shape = SHAPE_NONE
+    }
     r.shape = shape
     if (shape !== SHAPE_NONE) {
       // Reads of one shape wait for the next coalesced read: `batchReads` sends them.
@@ -1452,6 +1572,28 @@ export class ConduitWorker {
     r.stmt = 0
     r.found = false
     r.pgError = 0
+  }
+
+  /**
+   * Queues `r` in `shape`'s batcher under the key `<viewer> <slug>`: 1 when
+   * queued, 0 when the batcher is full, -1 when the slug is not a text
+   * Postgres takes (not UTF-8, or a NUL in it).
+   */
+  addBatched(r: ConduitReq, shape: i32): i32 {
+    const start: i32 = r.fStart[F_PATH]
+    const len: i32 = r.fLen[F_PATH]
+    if (!isText(r.text, start, start + len)) {
+      return -1
+    }
+    const key: u8[] = this.keyBuf
+    let n: i32 = jwtDigits(r.viewer, key, 0)
+    key[n] = toU8(32)
+    n += 1
+    for (let k: i32 = 0; k < len && n < toI32(key.length); k++) {
+      key[n] = r.text[start + k]
+      n++
+    }
+    return this.batchers[shape].addText(key, 0, n, r.index) ? 1 : 0
   }
 
   /** Marks `r` as waiting in one of the worker's rings for pool `p`, with no ticket yet. */
@@ -1490,8 +1632,22 @@ export class ConduitWorker {
       const pool: PgPool = this.pools[p]
       let s: i32 = pool.dispatch()
       while (s >= 0) {
-        const r: i32 = this.tickets[p][pool.ticket % TICKET_RING]
         const conn: PgConnection = pool.connection(s)
+        const at: i32 = pool.ticket % TICKET_RING
+        if (p === POOL_READ && this.ticketShape[at] !== SHAPE_NONE) {
+          // A batched read: its batcher binds the requests waiting now.
+          const shape: i32 = this.ticketShape[at]
+          this.batchAsked[shape] -= 1
+          this.ticketRun[at] = this.batchers[shape].take(conn)
+          if (!pool.send()) {
+            // Nothing was bound and nothing prepared: the pool dropped it.
+            this.ticketShape[at] = SHAPE_NONE
+            this.batchFlight[shape] -= 1
+          }
+          s = pool.dispatch()
+          continue
+        }
+        const r: i32 = this.tickets[p][at]
         const built: boolean = r >= 0 && r < toI32(this.reqs.length) && this.bindAll(this.reqs[r], conn)
         if (!pool.send() && conn.bindEnd()) {
           // A bind refused part way left the group open with the bind in it,
@@ -1619,15 +1775,35 @@ export class ConduitWorker {
 
   /**
    * Coalesced reads: while fewer of a shape's reads are in flight than
-   * `readLimit`, the reads of that shape waiting (up to `READ_BATCH`, and
-   * `READ_BATCH_BYTES` of arrays) become one request of the read pool, one
-   * statement over arrays. As with the writes nothing waits on a timer, and
-   * nothing is kept past the statement: each request answers from its own
-   * rows of it.
+   * `readLimit`, the reads of that shape waiting become one request of the
+   * read pool, one statement: a batched shape's `take` binds up to
+   * `READ_BATCH` of them over an array of keys, and a tags read takes every
+   * one waiting. As with the writes nothing waits on a timer, and nothing is
+   * kept past the statement: each request answers from its own rows of it.
    */
   batchReads(): void {
     const pool: PgPool = this.pools[POOL_READ]
-    for (let shape: i32 = 0; shape < SHAPES; shape++) {
+    for (let shape: i32 = 0; shape < BATCHED_SHAPES; shape++) {
+      // One pool request for each execution, while fewer than `readLimit`
+      // are asked for or in flight: `take` binds what waits when it is dispatched.
+      while (
+        this.batchers[shape].waiting() > this.batchAsked[shape] * READ_BATCH &&
+        this.batchFlight[shape] < this.readLimit
+      ) {
+        const ticket: i32 = pool.request()
+        if (ticket === PG_POOL_FULL) {
+          return
+        }
+        const at: i32 = ticket % TICKET_RING
+        this.tickets[POOL_READ][at] = -1
+        this.ticketShape[at] = shape
+        this.ticketRun[at] = -1
+        this.ticketEnded[at] = false
+        this.batchFlight[shape] += 1
+        this.batchAsked[shape] += 1
+      }
+    }
+    for (let shape: i32 = BATCHED_SHAPES; shape < SHAPES; shape++) {
       const ring: i32[] = this.readRing[shape]
       while (this.readCount[shape] > 0 && this.readBatches[shape] < this.readLimit) {
         const ticket: i32 = pool.request()
@@ -1635,17 +1811,8 @@ export class ConduitWorker {
           return
         }
         const head: i32 = this.readHead[shape]
-        let take: i32 = 0
-        let bytes: i32 = 0
-        while (take < this.readCount[shape] && (take < READ_BATCH || shape === SHAPE_TAGS)) {
-          // A tags read binds no arrays.
-          const cost: i32 = shape === SHAPE_TAGS ? 0 : readCost(this.reqs[ring[(head + take) % QUEUE]])
-          if (take > 0 && bytes + cost > READ_BATCH_BYTES - 8) {
-            break
-          }
-          bytes += cost
-          take += 1
-        }
+        // A tags read binds no arrays: it takes every request waiting.
+        const take: i32 = this.readCount[shape]
         for (let k: i32 = 0; k < take; k++) {
           const r: ConduitReq = this.reqs[ring[(head + k) % QUEUE]]
           r.ticket = ticket
@@ -1660,64 +1827,11 @@ export class ConduitWorker {
   }
 
   /**
-   * Binds a coalesced read: one request alone, or every request of a tags
-   * read, with its own statement; more as one statement over two parallel
-   * arrays, the slugs as a text array literal and the viewers as an int8 one.
+   * Binds a tags read: one execution of `tags`, whose one row answers every
+   * request in it.
    */
   bindReads(r: ConduitReq, conn: PgConnection): boolean {
-    if (r.batchNext < 0 || r.shape === SHAPE_TAGS) {
-      return this.bind(r, conn)
-    }
-    const a: u8[] = this.arrayBuf
-    let n: i32 = 0
-    a[n] = toU8(123)
-    n += 1
-    let k: i32 = r.index
-    while (k >= 0) {
-      const m: ConduitReq = this.reqs[k]
-      if (k !== r.index) {
-        a[n] = toU8(44)
-        n += 1
-      }
-      a[n] = toU8(34)
-      n += 1
-      const start: i32 = m.fStart[F_PATH]
-      const end: i32 = start + m.fLen[F_PATH]
-      for (let i: i32 = start; i < end; i++) {
-        const c: i32 = toI32(m.text[i])
-        if (c === 34 || c === 92) {
-          a[n] = toU8(92)
-          n += 1
-        }
-        a[n] = toU8(c)
-        n += 1
-      }
-      a[n] = toU8(34)
-      n += 1
-      k = m.batchNext
-    }
-    a[n] = toU8(125)
-    n += 1
-    // The viewers as a JSON array of integers, whose brackets become braces.
-    const slugs: i32 = n
-    const w: JsonWriter = this.arrayWriter
-    w.reset(a, slugs)
-    w.beginArray()
-    k = r.index
-    while (k >= 0) {
-      w.i64(this.reqs[k].viewer)
-      k = this.reqs[k].batchNext
-    }
-    w.endArray()
-    n = w.end
-    a[slugs] = toU8(123)
-    a[n - 1] = toU8(125)
-    return (
-      conn.bindStart(shapeStatement(r.shape)) &&
-      conn.paramBytes(a, 0, slugs) &&
-      conn.paramBytes(a, slugs, n - slugs) &&
-      conn.bindEnd()
-    )
+    return this.bind(r, conn)
   }
 
   /**
@@ -1870,6 +1984,8 @@ export class ConduitWorker {
       const ticket: i32 = pool.ticket
       if (ticket >= 0 && p === POOL_WRITE) {
         this.batchEvent(s, conn, ticket, event)
+      } else if (ticket >= 0 && this.ticketShape[ticket % TICKET_RING] !== SHAPE_NONE) {
+        this.batchedReadEvent(ticket, conn, event)
       } else if (ticket >= 0 && this.current[p][s] === ticket && this.readShape[s] !== SHAPE_NONE) {
         this.readEvent(s, conn, ticket, event)
       } else if (ticket >= 0) {
@@ -1889,7 +2005,6 @@ export class ConduitWorker {
             this.current[p][s] = ticket
             this.readShape[s] = r.shape
             this.readCursor[s] = ri
-            this.readPos[s] = 1
             this.readAlone[s] = r.batchNext < 0
             this.readError[s] = false
             this.begin(r, w, this.buffers[p][s])
@@ -2009,13 +2124,67 @@ export class ConduitWorker {
   }
 
   /**
-   * One event of a coalesced read. Its rows come in the order of the
-   * requests' places (`shapeOrd`; a request sent alone has only its own), so
-   * `readCursor` walks the batch: a row of a later place answers every
-   * request before it, a request with no row answering 404 on its own. A
-   * tags read's one row answers every request in it. A failed statement
-   * sends the requests not yet answered again alone, where each answers its
-   * own error; a lost connection answers them 500.
+   * One event of a batched read's execution, handed to its batcher, whose
+   * answers name the requests: each row goes to every request of its key,
+   * into that request's own answer, and each request then ends as found,
+   * missing (404) or failed. A failed execution sends its requests again
+   * alone, where each answers its own error; a lost connection answers them
+   * 500, since nothing is sent twice that may have run.
+   */
+  batchedReadEvent(ticket: i32, conn: PgConnection, event: i32): void {
+    const at: i32 = ticket % TICKET_RING
+    const shape: i32 = this.ticketShape[at]
+    const b: PgBatcher = this.batchers[shape]
+    const run: i32 = this.ticketRun[at]
+    const over: boolean = event === PG_GROUP_DONE || event === PG_LOST
+    if (run >= 0 && !this.ticketEnded[at]) {
+      if (event === PG_ROW) {
+        b.row(run, conn)
+      } else if (event === PG_COMPLETE) {
+        b.end(run)
+        this.ticketEnded[at] = true
+      } else if (event === PG_ERROR || over) {
+        b.fail(run)
+        this.ticketEnded[at] = true
+      }
+      let e: i32 = b.next(run)
+      while (e !== PG_BATCH_NONE) {
+        const m: ConduitReq = this.reqs[b.tag]
+        if (e === PG_BATCH_ROW) {
+          // Room for the row as the writer may write it, every byte escaped.
+          let need: i32 = 1024
+          for (let c: i32 = 0; c < conn.columns; c++) {
+            need += 6 * (conn.colLength(c) > 0 ? conn.colLength(c) : 0) + 16
+          }
+          m.ownGrow(need)
+          this.onRow(m, conn, m.ownWriter)
+        } else {
+          m.inPool = false
+          m.shape = SHAPE_NONE
+          if (e === PG_BATCH_DONE || e === PG_BATCH_MISSING) {
+            this.onDone(m, m.ownWriter, m.own)
+          } else if (event === PG_LOST) {
+            this.fail(m, 500, "the database connection was lost", true)
+          } else {
+            m.solo = true
+            this.submit(m, true)
+          }
+        }
+        e = b.next(run)
+      }
+    }
+    if (over) {
+      this.ticketShape[at] = SHAPE_NONE
+      this.ticketRun[at] = -1
+      this.batchFlight[shape] -= 1
+    }
+  }
+
+  /**
+   * One event of a tags read: its one row answers every request in it, and
+   * `readCursor` walks them. A failed statement sends the requests not yet
+   * answered again alone, where each answers its own error; a lost
+   * connection answers them 500.
    */
   readEvent(s: i32, conn: PgConnection, ticket: i32, event: i32): void {
     if (event === PG_ROW && this.readShape[s] === SHAPE_TAGS) {
@@ -2029,14 +2198,6 @@ export class ConduitWorker {
         }
         this.readNext(s)
         k = this.readCursor[s]
-      }
-    } else if (event === PG_ROW) {
-      const place: i32 = this.readAlone[s] ? 1 : toI32(conn.int(shapeOrd(this.readShape[s])))
-      while (this.readCursor[s] >= 0 && this.readPos[s] < place) {
-        this.readNext(s)
-      }
-      if (this.readCursor[s] >= 0) {
-        this.onRow(this.reqs[this.readCursor[s]], conn, this.writers[POOL_READ][s])
       }
     } else if (event === PG_ERROR) {
       this.readError[s] = true
@@ -2085,7 +2246,6 @@ export class ConduitWorker {
     m.inPool = false
     m.shape = SHAPE_NONE
     this.readCursor[s] = next
-    this.readPos[s] += 1
     this.onDone(m, w, buf)
     if (next >= 0) {
       this.begin(this.reqs[next], w, buf)
