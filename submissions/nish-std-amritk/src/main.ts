@@ -4,11 +4,12 @@
 // nish/crypto's HMAC and bcrypt, nish/net/prefork. README.md has the design
 // and the measurements.
 //
-// One supervisor and HTTP_WORKERS + 1 worker processes (nish/net/prefork,
+// One supervisor and HTTP_WORKERS + BCRYPT_WORKERS worker processes (nish/net/prefork,
 // restarts off: the challenge's rule 9 does not restart a crashed server, so
 // neither does this). Workers 0 to HTTP_WORKERS - 1 each bind HOST:PORT with
 // SO_REUSEPORT and serve HTTP on their own loop and their own Postgres
-// connections; the last runs the bcrypt service on 127.0.0.1:BCRYPT_PORT.
+// connections; the rest each run a bcrypt service, on 127.0.0.1:BCRYPT_PORT
+// and the ports above it.
 //
 // Configured by the environment only: DATABASE_URL, JWT_SECRET, HOST, PORT
 // (the challenge's), and optionally HTTP_WORKERS (2), DB_READ_CONNS (3) and
@@ -16,12 +17,13 @@
 // for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
 // per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_BATCH_MS (160), BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160),
+// BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
 import { tcpListenFlags } from "nish:net"
-import { getenv } from "nish:process"
+import { availableParallelism, getenv } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
 import { runBcryptService } from "./bcrypt-service"
-import { ConduitWorker, WorkerConfig } from "./worker"
+import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
 const LISTEN_FLAGS: i32 = 3
@@ -105,17 +107,23 @@ export const main = (): i32 => {
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
   const http: i32 = envInt("HTTP_WORKERS", 2)
+  // Logins wait on bcrypt, which gets a fair share of a core per process
+  // while Postgres keeps every core busy: one process fell behind them.
+  const half: i32 = availableParallelism() / 2
+  const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
+  cfg.bcryptServices = services > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : services
   const prefork = new PreforkConfig()
-  prefork.workers = http + 1
+  prefork.workers = http + cfg.bcryptServices
   prefork.restart = false
   const index: i32 = preforkWith(process.argv, prefork)
   if (index < 0) {
     return index === PREFORK_STOPPED ? 0 : 1
   }
-  if (index === http) {
-    const listener: i32 = tcpListenFlags("127.0.0.1", cfg.bcryptPort, 1024, 2)
+  if (index >= http) {
+    const port: i32 = cfg.bcryptPort + index - http
+    const listener: i32 = tcpListenFlags("127.0.0.1", port, 1024, 2)
     if (listener < 0) {
-      console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${cfg.bcryptPort} (${listener})`)
+      console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
     }
     return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160))

@@ -1,6 +1,6 @@
 // One HTTP worker: a single-threaded `pollWait` loop holding its share of the
 // listener (SO_REUSEPORT), every keep-alive connection the kernel gives it,
-// two `PgPool`s (reads and writes) and one connection to the bcrypt service.
+// two `PgPool`s (reads and writes) and one connection to each bcrypt service.
 // It is tests/postgres/carrier.ts's shape, with the Conduit API on top.
 //
 // A request is parsed when its head arrives and checked when its body ends:
@@ -192,10 +192,14 @@ const FIELDS_COMMENT: i32 = 64 // body
 const POOL_READ: i32 = 0
 const POOL_WRITE: i32 = 1
 
-/** Tokens in the loop: the listener, the bcrypt service, then pool slots below; HTTP slots are 0 and up. */
+/** Tokens in the loop: the listener, the bcrypt services (-2 down), then pool slots below; HTTP slots are 0 and up. */
 const TOKEN_LISTENER: i32 = -1
 const TOKEN_BCRYPT: i32 = -2
 const TOKEN_POOL: i32 = -16
+/** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_POOL`. */
+export const BCRYPT_SERVICES_MAX: i32 = 14
+/** The jobs one bcrypt call takes (`bcryptHash4`, `bcryptVerify4`). */
+const BCRYPT_LANES: i32 = 4
 const POOL_TOKENS: i32 = 1024
 
 const AGAIN: i32 = -11
@@ -318,6 +322,8 @@ class ConduitReq {
   folded: boolean = false
   /** On a batch's first request: how many statements bound before its own, which answer no request. */
   prefix: i32 = 0
+  /** The bcrypt service its password went to, while `inBcrypt`. */
+  bcryptAt: i32 = -1
   /** A batched write's own answer: its writer and the buffer it writes. */
   own: u8[]
   ownWriter: JsonWriter
@@ -528,6 +534,8 @@ export class WorkerConfig {
   planClock: i32 = 1
   planLight: i32 = 32
   bcryptPort: i32 = 47391
+  /** How many bcrypt services listen, on `bcryptPort` and up. */
+  bcryptServices: i32 = 1
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
@@ -584,11 +592,8 @@ export class ConduitWorker {
   fragments: u8[][]
   stringColumns: i32[]
   tokenBuf: u8[]
-  bcrypt: BcryptClient
-  bcryptAddress: u8[]
-  /** When a bcrypt connect last failed, for the retry; 0 while none has. */
-  bcryptFailedAt: i64 = 0
-  bcryptRetryAt: i64 = 0
+  /** One client a bcrypt service. */
+  bcrypts: BcryptClient[]
   /** Requests answered, for a reader of `/proc`. */
   answered: i64 = 0
   /** Writes waiting for the next batch, a ring oldest first; and how many batches are in flight. */
@@ -707,8 +712,13 @@ export class ConduitWorker {
     ]
     this.stringColumns = [COL_SLUG, COL_TITLE, COL_DESCRIPTION, COL_BODY, COL_USERNAME, COL_BIO, COL_IMAGE]
     this.tokenBuf = new Array<u8>(512)
-    this.bcrypt = new BcryptClient()
-    this.bcryptAddress = new Array<u8>(18)
+    this.bcrypts = []
+    const services: i32 = cfg.bcryptServices < 1 ? 1 : cfg.bcryptServices > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : cfg.bcryptServices
+    for (let k: i32 = 0; k < services; k++) {
+      const c = new BcryptClient()
+      netAddress(c.address, "127.0.0.1", cfg.bcryptPort + k)
+      this.bcrypts.push(c)
+    }
     this.writeRing = new Array<i32>(QUEUE)
     this.deferred = []
     this.writeCursor = new Array<i32>(this.pools[POOL_WRITE].size)
@@ -735,7 +745,6 @@ export class ConduitWorker {
     for (let k: i32 = 0; k < TICKET_RING; k++) {
       this.ticketPlan[k] = -1
     }
-    netAddress(this.bcryptAddress, "127.0.0.1", cfg.bcryptPort)
   }
 
   // ---- The loop -------------------------------------------------------------------
@@ -745,7 +754,10 @@ export class ConduitWorker {
     const ready: i32[] = new Array<i32>(2 * 512)
     while (true) {
       this.pump()
-      let wait: i32 = this.bcryptRetryAt > 0 ? 50 : 1000
+      let wait: i32 = 1000
+      for (const c of this.bcrypts) {
+        wait = c.retryAt > 0 ? 50 : wait
+      }
       const left: i64 = this.planWaitLeft()
       if (left > 0) {
         // Woken when the oldest read's window ends, to the millisecond above.
@@ -777,8 +789,11 @@ export class ConduitWorker {
       }
     } else if (token === TOKEN_LISTENER) {
       this.acceptAll()
-    } else if (token === TOKEN_BCRYPT) {
-      this.bcryptReady(events)
+    } else if (token <= TOKEN_BCRYPT && token > TOKEN_POOL) {
+      const k: i32 = TOKEN_BCRYPT - token
+      if (k < toI32(this.bcrypts.length)) {
+        this.bcryptReady(k, events)
+      }
     } else {
       const n: i32 = TOKEN_POOL - token
       const p: i32 = n / POOL_TOKENS
@@ -2882,18 +2897,37 @@ export class ConduitWorker {
 
   // ---- bcrypt ---------------------------------------------------------------------
 
-  /** Sends `r`'s password to the bcrypt service: a new hash, or a check against `F_HASH`. */
+  /**
+   * The bcrypt service the next job goes to: the one whose batch is the
+   * closest to full without being full, so a service's four lanes fill
+   * before the next is given work; and while every batch is full, the least
+   * busy. Several services each get the box's fair share of a core when
+   * Postgres keeps every core busy, where one alone fell behind the logins.
+   */
+  bcryptPick(): i32 {
+    let best: i32 = 0
+    let bestPart: i32 = -1
+    let idle: i32 = 0
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      const n: i32 = this.bcrypts[k].inFlight
+      const part: i32 = n % BCRYPT_LANES
+      if (part > bestPart) {
+        bestPart = part
+        best = k
+      }
+      if (n < this.bcrypts[idle].inFlight) {
+        idle = k
+      }
+    }
+    return bestPart > 0 ? best : idle
+  }
+
+  /** Sends `r`'s password to a bcrypt service: a new hash, or a check against `F_HASH`. */
   toBcrypt(r: ConduitReq, op: i32, later: boolean): void {
+    const k: i32 = this.bcryptPick()
+    const c: BcryptClient = this.bcrypts[k]
     const hashLen: i32 = op === BCRYPT_OP_VERIFY ? r.fLen[F_HASH] : 0
-    const queued: boolean = this.bcrypt.request(
-      op,
-      r.index,
-      r.pw,
-      r.pwLen,
-      r.text,
-      r.fStart[F_HASH],
-      hashLen < 0 ? 0 : hashLen
-    )
+    const queued: boolean = c.request(op, r.index, r.pw, r.pwLen, r.text, r.fStart[F_HASH], hashLen < 0 ? 0 : hashLen)
     wipe(r.pw)
     r.pwLen = -1
     if (!queued) {
@@ -2901,33 +2935,33 @@ export class ConduitWorker {
       return
     }
     r.inBcrypt = true
-    if (this.bcrypt.fd < 0) {
-      this.bcryptConnect()
-    } else if (this.bcrypt.connected) {
-      if (!this.bcrypt.send()) {
-        this.bcryptLost()
+    r.bcryptAt = k
+    c.inFlight += 1
+    if (c.fd < 0) {
+      if (c.retryAt === 0) {
+        this.bcryptConnect(k)
+      }
+    } else if (c.connected) {
+      if (!c.send()) {
+        this.bcryptLost(k)
       } else {
-        pollModify(
-          this.loop,
-          this.bcrypt.fd,
-          this.bcrypt.outputEnd > this.bcrypt.outputStart ? 3 : 1,
-          TOKEN_BCRYPT
-        )
+        pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT - k)
       }
     }
   }
 
-  bcryptConnect(): void {
-    const fd: i32 = tcpConnect(this.bcryptAddress)
-    if (fd < 0 || pollAdd(this.loop, fd, H1_WANT_WRITE, TOKEN_BCRYPT) < 0) {
+  bcryptConnect(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
+    const fd: i32 = tcpConnect(c.address)
+    if (fd < 0 || pollAdd(this.loop, fd, H1_WANT_WRITE, TOKEN_BCRYPT - k) < 0) {
       if (fd >= 0) {
         netClose(fd)
       }
-      this.bcryptRefused()
+      this.bcryptRefused(k)
       return
     }
-    this.bcrypt.fd = fd
-    this.bcrypt.connected = false
+    c.fd = fd
+    c.connected = false
   }
 
   /**
@@ -2935,44 +2969,51 @@ export class ConduitWorker {
    * output and the connect is tried again shortly, for `BCRYPT_PATIENCE`
    * (the service may still be starting); then they fail.
    */
-  bcryptRefused(): void {
+  bcryptRefused(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
     const now: i64 = monotonicNanos()
-    if (this.bcryptFailedAt === 0) {
-      this.bcryptFailedAt = now
+    if (c.failedAt === 0) {
+      c.failedAt = now
     }
-    if (now - this.bcryptFailedAt > BCRYPT_PATIENCE) {
-      this.bcryptFailedAt = 0
-      this.bcryptRetryAt = 0
-      this.bcryptLost()
+    if (now - c.failedAt > BCRYPT_PATIENCE) {
+      c.failedAt = 0
+      c.retryAt = 0
+      this.bcryptLost(k)
       return
     }
-    this.bcryptRetryAt = now + 50000000
+    c.retryAt = now + 50000000
   }
 
   bcryptTick(): void {
-    if (this.bcryptRetryAt > 0 && monotonicNanos() >= this.bcryptRetryAt && this.bcrypt.fd < 0) {
-      this.bcryptRetryAt = 0
-      this.bcryptConnect()
+    const now: i64 = monotonicNanos()
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      const c: BcryptClient = this.bcrypts[k]
+      if (c.retryAt > 0 && now >= c.retryAt && c.fd < 0) {
+        c.retryAt = 0
+        this.bcryptConnect(k)
+      }
     }
   }
 
-  /** The service went away with requests on it: they fail, since their passwords are gone. */
-  bcryptLost(): void {
-    if (this.bcrypt.fd >= 0) {
-      pollRemove(this.loop, this.bcrypt.fd)
-      netClose(this.bcrypt.fd)
+  /** Service `k` went away with requests on it: they fail, since their passwords are gone. */
+  bcryptLost(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
+    if (c.fd >= 0) {
+      pollRemove(this.loop, c.fd)
+      netClose(c.fd)
     }
-    this.bcrypt.reset()
+    c.reset()
     for (const r of this.reqs) {
-      if (r.inBcrypt) {
+      if (r.inBcrypt && r.bcryptAt === k) {
         r.inBcrypt = false
+        r.bcryptAt = -1
         this.fail(r, 500, "the password service is unavailable", true)
       }
     }
   }
 
-  bcryptReady(events: i32): void {
-    const c: BcryptClient = this.bcrypt
+  bcryptReady(k: i32, events: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
     if (c.fd < 0) {
       return
     }
@@ -2981,34 +3022,35 @@ export class ConduitWorker {
         pollRemove(this.loop, c.fd)
         netClose(c.fd)
         c.fd = -1
-        this.bcryptRefused()
+        this.bcryptRefused(k)
         return
       }
       c.connected = true
-      this.bcryptFailedAt = 0
+      c.failedAt = 0
     }
     if ((events & READABLE) !== 0) {
       if (!c.receive()) {
-        this.bcryptLost()
+        this.bcryptLost(k)
         return
       }
       while (c.nextReply()) {
         const ri: i32 = c.replyId
-        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inBcrypt) {
-          this.onBcrypt(this.reqs[ri])
+        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inBcrypt && this.reqs[ri].bcryptAt === k) {
+          c.inFlight -= 1
+          this.onBcrypt(this.reqs[ri], c)
         }
       }
     }
     if (!c.send()) {
-      this.bcryptLost()
+      this.bcryptLost(k)
       return
     }
-    pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT)
+    pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT - k)
   }
 
-  onBcrypt(r: ConduitReq): void {
+  onBcrypt(r: ConduitReq, c: BcryptClient): void {
     r.inBcrypt = false
-    const c: BcryptClient = this.bcrypt
+    r.bcryptAt = -1
     if (r.route === R_LOGIN) {
       if (c.replyStatus !== BCRYPT_DONE) {
         this.fail(r, 401, "invalid credentials", true)
