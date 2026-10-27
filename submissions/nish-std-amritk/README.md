@@ -2,7 +2,7 @@
 
 Front: direct
 
-Nish 0.22.1 (a statically typed TypeScript subset compiled to native code
+Nish 0.23.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -16,8 +16,8 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.22.1, the first published release with the
-standard-library changes it uses (`PreforkConfig.restart`,
+The server needs Nish 0.23.0, the newest published release (0.22.1 was the
+first with the standard-library changes it uses: `PreforkConfig.restart`,
 `Http1Config.idleInput`, `TCP_NODELAY` on `tcpConnect`); `install.sh`
 installs it from npm. To try an unreleased build instead, set `NISH_PACKAGES`
 to the `npm pack` tarballs of the compiler and its platform package.
