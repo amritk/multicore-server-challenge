@@ -1491,8 +1491,7 @@ export class ConduitWorker {
       route === R_UNFOLLOW ||
       route === R_ARTICLE_CREATE ||
       route === R_ARTICLE_DELETE ||
-      route === R_FAVORITE ||
-      route === R_UNFAVORITE ||
+      ((route === R_FAVORITE || route === R_UNFAVORITE) && r.phase === 0) ||
       route === R_COMMENT_CREATE ||
       route === R_COMMENT_DELETE
     ) {
@@ -1561,6 +1560,10 @@ export class ConduitWorker {
       return K_TAGS
     } else if (r.route === R_ARTICLE_GET || r.route === R_COMMENTS) {
       kind = r.route === R_ARTICLE_GET ? K_ARTICLE : K_COMMENTS
+      f = F_PATH
+    } else if ((r.route === R_FAVORITE || r.route === R_UNFAVORITE) && r.phase === 1) {
+      // A toggle's article, read once its write has committed.
+      kind = K_ARTICLE
       f = F_PATH
     } else if (r.route === R_PROFILE) {
       kind = K_PROFILE
@@ -2045,9 +2048,6 @@ export class ConduitWorker {
   /** How many statements `r`'s group runs, so a batch knows where each request's answers end. */
   statements(r: ConduitReq): i32 {
     switch (r.route) {
-      case R_FAVORITE:
-      case R_UNFAVORITE:
-        return r.folded ? 1 : 2
       case R_ARTICLE_CREATE:
         return r.tags > 0 ? 4 : 2
       case R_ARTICLE_PUT:
@@ -2392,16 +2392,19 @@ export class ConduitWorker {
         break
       case R_FAVORITE:
       case R_UNFAVORITE:
-        ok =
-          (r.folded ||
-            (conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
-              conn.paramInt(r.viewer) &&
-              this.text(conn, r, F_PATH) &&
-              conn.bindEnd())) &&
-          conn.bindStart("article_slug") &&
-          conn.paramInt(r.viewer) &&
-          this.text(conn, r, F_PATH) &&
-          conn.bindEnd()
+        // Phase 0 is the write (a folded one's was its batch's); phase 1 its
+        // article, sent alone here only when a read plan could not answer it.
+        if (r.phase === 1) {
+          ok = conn.bindStart("article_slug") && conn.paramInt(r.viewer) && this.text(conn, r, F_PATH) && conn.bindEnd()
+        } else if (r.folded) {
+          ok = conn.bindStart("noop") && conn.bindEnd()
+        } else {
+          ok =
+            conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
+            conn.paramInt(r.viewer) &&
+            this.text(conn, r, F_PATH) &&
+            conn.bindEnd()
+        }
         break
       case R_COMMENTS:
         ok =
@@ -2508,8 +2511,8 @@ export class ConduitWorker {
         break
       case R_FAVORITE:
       case R_UNFAVORITE:
-        // Folded, the article read is its first statement: the write was its batch's.
-        if (r.stmt === (r.folded ? 0 : 1)) {
+        // Only phase 1, the article read alone, has a row to write.
+        if (r.phase === 1) {
           this.mainArticle(r, w, conn)
         }
         break
@@ -2873,6 +2876,16 @@ export class ConduitWorker {
         }
         this.toBcrypt(r, BCRYPT_OP_VERIFY, true)
         return
+      case R_FAVORITE:
+      case R_UNFAVORITE:
+        if (r.phase === 0) {
+          // The write has committed: its article is read by the next read plan.
+          r.phase = 1
+          r.solo = false
+          this.submit(r, true)
+          return
+        }
+        break
       case R_ARTICLE_PUT:
         if (r.phase === 0) {
           if (!r.found) {

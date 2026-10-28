@@ -232,7 +232,10 @@ export const registerStatements = (pool: PgPool): boolean => {
         "d AS (DELETE FROM articles a USING a0 WHERE a.id = a0.id AND a0.author_id = $2) SELECT author_id FROM a0",
       none
     ) && ok
-  // Favorites: the write, then the article as it is after it, in one group.
+  // Favorites: the write; the article as it is after it is then read by a
+  // read plan, like an article page. A folded write's request runs `noop`,
+  // so that every request of a write batch has a statement of its own.
+  ok = pool.register("noop", "SELECT 1", none) && ok
   ok =
     pool.register(
       "favorite",
@@ -246,7 +249,7 @@ export const registerStatements = (pool: PgPool): boolean => {
       none
     ) && ok
   // A write batch's favorites and unfavorites, each kind one statement over
-  // the batch's (viewer, slug) pairs; each request then reads its article.
+  // the batch's (viewer, slug) pairs; each request then reads its article in a plan.
   ok =
     pool.register(
       "favorite_many",
