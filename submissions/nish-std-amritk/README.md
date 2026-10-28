@@ -9,7 +9,7 @@ logins go to bcrypt services in their own processes, every connection sets
 `enable_memoize=off`, the viewers' flags are sent as one id array per viewer,
 half the CPUs serve HTTP (four on the box, where #83 ran two), and Nish
 0.23.1 no longer sweeps every idle connection on every turn of the loop. On a VM like the box, #83's build
-held 90,000 users and this one 140,000 (below; not official).
+held 90,000 users and this one 150,000 (below; not official).
 
 Nish 0.23.1 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
@@ -291,7 +291,8 @@ and Postgres 47%), so the VM reads about 1% low.
 | `40b375e` | `HTTP_WORKERS=3` | 110,000 | 28,224 | 250 ms | 313 ms | 39% / 57% / 96% |
 | `40b375e` | `HTTP_WORKERS=4`, three searches | 110,000–120,000 | 28,401–30,483 | 184–419 ms | 232–513 ms | 39% / 58% / 97–98% |
 | `40b375e` | `HTTP_WORKERS=5` | 120,000 | 30,055 | 446 ms | 612 ms | 38% / 59% / 98% |
-| this build | its defaults (four workers, sweep once a second), two searches | 140,000 | 35,407–36,107 | 240–406 ms | 333–603 ms | 28% / 67% / 97% |
+| `0475a77` | its defaults (four workers, sweep once a second), two searches | 140,000 | 35,407–36,107 | 240–406 ms | 333–603 ms | 28% / 67% / 97% |
+| this build | its defaults, a 5-minute hold at 150,000 | 150,000 | 38,902 | 175 ms | 661 ms | 31% / 66% / 98% |
 
 With four workers 130,000 failed its probe (p95 730 ms), with throughput flat
 at about 30,500 req/s. Two workers left the box about a sixth idle; four use
@@ -300,7 +301,13 @@ that takes the network interrupts is the first to run out (about 30% of it in
 softirq). With the idle sweep once a second, the server's share of the box
 fell from 39% to 28%, which Postgres took: 140,000 held at the top of the
 searches' range, and 145,000 passed a probe (p95 483 ms) but not a 5-minute
-hold (p95 634 ms).
+hold (p95 634 ms). This build, on Nish 0.23.1, held 150,000 in a 5-minute
+hold on the official pass rule (`loadgen run`, 60 s ramp and 300 s
+measured), above the searches' range. The VM's speed drifts by about 8% over
+a day, so the hold was run once a check at 140,000 matched the earlier
+measurements. The box was 98% busy: Postgres about 136 µs of CPU a request
+and the server 63. At the end of every ramp both VMs retransmit for a few
+seconds, which the load generator can report as itself falling behind.
 
 ## Credits
 
