@@ -238,6 +238,19 @@ export class ReadPlan {
   askKind: i32[]
   askSlot: i32[]
   asks: i32 = 0
+  /**
+   * Each ask's viewer, as its place in `flagViewers` (the plan's distinct
+   * signed-in viewers); the place `ask` records; and the asks grouped by
+   * viewer and kind for `bindB` (`askOrder`, bucket `2 * place + kind`
+   * starting at `askStart[bucket]`), and the text of one viewer's ids.
+   */
+  askVi: i32[]
+  flagViewers: i64[]
+  flagViewerN: i32 = 0
+  private curVi: i32 = 0
+  private askOrder: i32[]
+  private askStart: i32[]
+  private flagText: u8[]
   private readonly askTable: i32[]
   /** Group A's statements in the order bound, and how many have completed; whether a statement failed. */
   readonly stmts: i32[]
@@ -342,6 +355,11 @@ export class ReadPlan {
     this.askId = new Array<i64>(4096)
     this.askKind = new Array<i32>(4096)
     this.askSlot = new Array<i32>(4096)
+    this.askVi = new Array<i32>(4096)
+    this.flagViewers = new Array<i64>(PLAN_MAX)
+    this.askOrder = new Array<i32>(4096)
+    this.askStart = new Array<i32>(2 * PLAN_MAX + 1)
+    this.flagText = new Array<u8>(4096)
     this.askTable = new Array<i32>(ID_TABLE)
     this.stmts = new Array<i32>(KINDS)
     this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
@@ -1133,9 +1151,22 @@ export class ReadPlan {
 
   /** After group A: queues the articles of slug reads, and the flags every viewer needs; whether group B has anything to read. */
   planB(): boolean {
+    this.flagViewerN = 0
     for (let i: i32 = 0; i < this.count; i++) {
       const kind: i32 = this.kinds[i]
       const v: i64 = this.viewers[i]
+      if (v !== 0) {
+        // The viewer's place among the plan's distinct viewers, at most PLAN_MAX of them.
+        let vi: i32 = 0
+        while (vi < this.flagViewerN && this.flagViewers[vi] !== v) {
+          vi++
+        }
+        if (vi === this.flagViewerN) {
+          this.flagViewers[vi] = v
+          this.flagViewerN = vi + 1
+        }
+        this.curVi = vi
+      }
       if (kind === K_ARTICLE) {
         const key: i32 = this.pageOf[i]
         if (this.slugFound[key]) {
@@ -1199,17 +1230,55 @@ export class ReadPlan {
       this.stmtCount += 1
     }
     if (this.asks > 0) {
-      if (!conn.bindStart("plan_flags")) {
+      // The asks by viewer and kind, a counting sort: Postgres then takes
+      // each viewer's ids as one array instead of regrouping every pair.
+      const buckets: i32 = 2 * this.flagViewerN
+      for (let b: i32 = 0; b <= buckets; b++) {
+        this.askStart[b] = 0
+      }
+      for (let k: i32 = 0; k < this.asks; k++) {
+        this.askStart[2 * this.askVi[k] + this.askKind[k] + 1] += 1
+      }
+      for (let b: i32 = 0; b < buckets; b++) {
+        this.askStart[b + 1] += this.askStart[b]
+      }
+      this.askOrder = grownI32(this.askOrder, this.asks, 0)
+      for (let k: i32 = 0; k < this.asks; k++) {
+        const b: i32 = 2 * this.askVi[k] + this.askKind[k]
+        this.askOrder[this.askStart[b]] = k
+        this.askStart[b] += 1
+      }
+      // Each bucket's start moved to its end: walk back one bucket.
+      for (let b: i32 = buckets; b > 0; b--) {
+        this.askStart[b] = this.askStart[b - 1]
+      }
+      this.askStart[0] = 0
+      if (!conn.bindStart("plan_flags") || !conn.paramIntArray(this.flagViewers, 0, this.flagViewerN)) {
         return false
       }
-      for (let part: i32 = 0; part < 4; part++) {
-        // Favorited viewers, their articles; following viewers, their authors.
+      for (let kind: i32 = 0; kind < 2; kind++) {
+        // Favorited: each viewer's articles; following: each viewer's authors.
         if (!conn.arrayStart()) {
           return false
         }
-        const kind: i32 = part < 2 ? 0 : 1
-        for (let k: i32 = 0; k < this.asks; k++) {
-          if (this.askKind[k] === kind && !conn.arrayInt(part % 2 === 0 ? this.askV[k] : this.askId[k])) {
+        for (let vi: i32 = 0; vi < this.flagViewerN; vi++) {
+          const b: i32 = 2 * vi + kind
+          const n: i32 = this.askStart[b + 1] - this.askStart[b]
+          this.flagText = grownBytes(this.flagText, 21 * n + 2, 0)
+          const t: u8[] = this.flagText
+          let o: i32 = 0
+          t[o] = toU8(123)
+          o++
+          for (let j: i32 = this.askStart[b]; j < this.askStart[b + 1]; j++) {
+            if (j > this.askStart[b]) {
+              t[o] = toU8(44)
+              o++
+            }
+            o = jwtDigits(this.askId[this.askOrder[j]], t, o)
+          }
+          t[o] = toU8(125)
+          o++
+          if (!conn.arrayElement(t, 0, o)) {
             conn.arrayEnd()
             return false
           }
@@ -1434,6 +1503,8 @@ export class ReadPlan {
     this.askId = grownInts(this.askId, k + 1, k)
     this.askKind = grownI32(this.askKind, k + 1, k)
     this.askSlot = grownI32(this.askSlot, k + 1, k)
+    this.askVi = grownI32(this.askVi, k + 1, k)
+    this.askVi[k] = this.curVi
     this.askSlot[k] = slot
     this.askV[k] = v
     this.askId[k] = id

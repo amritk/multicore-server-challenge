@@ -412,14 +412,16 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
     ) && ok
   // The flags: (0, viewer, article) for each favorite asked about that
   // exists, (1, viewer, user) for each follow; each viewer's in one range
-  // scan of the primary key over its ids.
+  // scan of the primary key over its ids. Each viewer's ids come as one
+  // `int8[]` literal, grouped by the plan: regrouping (viewer, id) pairs
+  // here took half the statement's time.
   ok =
     pool.register(
       "plan_flags",
-      "SELECT 0::int8, g.v, f.article_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($1::int8[], $2::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids)) f " +
-        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($3::int8[], $4::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids)) fo",
+      "SELECT 0::int8, g.v, f.article_id FROM unnest($1::int8[], $2::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids::int8[])) f " +
+        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM unnest($1::int8[], $3::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids::int8[])) fo",
       none
     ) && ok
   return ok
