@@ -109,6 +109,7 @@ import {
   PLAN_ALONE,
   ReadPlan,
 } from "./plan"
+import { PLAN_REPLY_ALONE, PlanClient } from "./plan-service"
 import {
   COL_BIO,
   COL_BODY,
@@ -196,6 +197,8 @@ const POOL_WRITE: i32 = 1
 const TOKEN_LISTENER: i32 = -1
 const TOKEN_BCRYPT: i32 = -2
 const TOKEN_POOL: i32 = -16
+/** The plan service's socket: below every pool token. */
+const TOKEN_PLAN: i32 = -16 - 2 * 1024
 /** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_POOL`. */
 export const BCRYPT_SERVICES_MAX: i32 = 14
 /** The jobs one bcrypt call takes (`bcryptHash4`, `bcryptVerify4`). */
@@ -322,6 +325,8 @@ class ConduitReq {
   folded: boolean = false
   /** On a batch's first request: how many statements bound before its own, which answer no request. */
   prefix: i32 = 0
+  /** A read the plan service holds: `inPool` too, so a closed slot leaves it to come back. */
+  inPlan: boolean = false
   /** The bcrypt service its password went to, while `inBcrypt`. */
   bcryptAt: i32 = -1
   /** A batched write's own answer: its writer and the buffer it writes. */
@@ -536,13 +541,18 @@ export class WorkerConfig {
   bcryptPort: i32 = 47391
   /** How many bcrypt services listen, on `bcryptPort` and up. */
   bcryptServices: i32 = 1
+  /** Whether the read plans run in the plan service (plan-service.ts), on `planPort`, rather than here. */
+  planService: boolean = false
+  planPort: i32 = 47390
+  /** How long a write waits for others to join its batch while the write connection is idle; 0 sends it at once. */
+  writeWaitUs: i32 = 0
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
 }
 
 /** A pool's connection settings, with up to `maxInFlight` groups in flight on each connection. */
-const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
+export const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
   const config = new PgConfig()
   config.user = cfg.dbUser
   config.database = cfg.dbName
@@ -597,6 +607,8 @@ export class ConduitWorker {
   tokenBuf: u8[]
   /** One client a bcrypt service. */
   bcrypts: BcryptClient[]
+  /** The plan service, when the read plans run there. */
+  planClient: PlanClient | null = null
   /** Requests answered, for a reader of `/proc`. */
   answered: i64 = 0
   /** Writes waiting for the next batch, a ring oldest first; and how many batches are in flight. */
@@ -604,6 +616,9 @@ export class ConduitWorker {
   writeHead: i32 = 0
   writeCount: i32 = 0
   writeBatches: i32 = 0
+  /** When each write in `writeRing` came, in ns, by its place; and how long a write waits for company (`WorkerConfig.writeWaitUs`). */
+  writeAt: i64[]
+  writeWait: i64 = 0
   /** The chains of writes `bindAll` held back this pump, by their first request. */
   deferred: i32[]
   /** Per write-pool slot: the request of its batch whose statements are being answered, and the batch's statements before it left. */
@@ -722,7 +737,14 @@ export class ConduitWorker {
       netAddress(c.address, "127.0.0.1", cfg.bcryptPort + k)
       this.bcrypts.push(c)
     }
+    if (cfg.planService) {
+      const c = new PlanClient()
+      netAddress(c.address, "127.0.0.1", cfg.planPort)
+      this.planClient = c
+    }
     this.writeRing = new Array<i32>(QUEUE)
+    this.writeAt = new Array<i64>(QUEUE)
+    this.writeWait = toI64(cfg.writeWaitUs) * 1000
     this.deferred = []
     this.writeCursor = new Array<i32>(this.pools[POOL_WRITE].size)
     this.writePrefix = new Array<i32>(this.pools[POOL_WRITE].size)
@@ -756,16 +778,26 @@ export class ConduitWorker {
   run(): i32 {
     const ready: i32[] = new Array<i32>(2 * 512)
     this.bcryptStart()
+    this.planConnect()
     while (true) {
       this.pump()
       let wait: i32 = 1000
       for (const c of this.bcrypts) {
         wait = c.retryAt > 0 ? 50 : wait
       }
+      const pc: PlanClient | null = this.planClient
+      if (pc !== null && pc.retryAt > 0) {
+        wait = 50
+      }
       const left: i64 = this.planWaitLeft()
       if (left > 0) {
         // Woken when the oldest read's window ends, to the millisecond above.
         const ms: i32 = toI32((left + 999999) / 1000000)
+        wait = ms < wait ? ms : wait
+      }
+      const writeLeft: i64 = this.writeWaitLeft()
+      if (writeLeft > 0) {
+        const ms: i32 = toI32((writeLeft + 999999) / 1000000)
         wait = ms < wait ? ms : wait
       }
       const n: i32 = pollWait(this.loop, ready, wait)
@@ -777,6 +809,7 @@ export class ConduitWorker {
       }
       this.server.expire(monotonicNanos())
       this.bcryptTick()
+      this.planTick()
     }
   }
 
@@ -793,6 +826,8 @@ export class ConduitWorker {
       }
     } else if (token === TOKEN_LISTENER) {
       this.acceptAll()
+    } else if (token === TOKEN_PLAN) {
+      this.planReady(events)
     } else if (token <= TOKEN_BCRYPT && token > TOKEN_POOL) {
       const k: i32 = TOKEN_BCRYPT - token
       if (k < toI32(this.bcrypts.length)) {
@@ -899,6 +934,7 @@ export class ConduitWorker {
     r.slot = -1
     r.inPool = false
     r.inBcrypt = false
+    r.inPlan = false
     this.free.push(r.index)
   }
 
@@ -911,6 +947,11 @@ export class ConduitWorker {
    * after it: its next pipelined request may be waiting.
    */
   answer(r: ConduitReq, status: i32, buf: u8[], len: i32, later: boolean): void {
+    this.answerAt(r, status, buf, 0, len, later)
+  }
+
+  /** `answer` with the body at `buf[off, off + len)`. */
+  answerAt(r: ConduitReq, status: i32, buf: u8[], off: i32, len: i32, later: boolean): void {
     const slot: i32 = r.slot
     const live: boolean =
       slot >= 0 &&
@@ -927,7 +968,7 @@ export class ConduitWorker {
       conn.respond(status, this.noNames, this.noNames, HTTP1_NO_BODY)
     } else {
       conn.respond(status, this.jsonNames, this.jsonValues, len)
-      conn.write(buf, 0, len)
+      conn.write(buf, off, len)
     }
     conn.end()
     if (later) {
@@ -1502,8 +1543,21 @@ export class ConduitWorker {
         return
       }
       this.writeRing[(this.writeHead + this.writeCount) % QUEUE] = r.index
+      this.writeAt[(this.writeHead + this.writeCount) % QUEUE] = monotonicNanos()
       this.writeCount += 1
       return
+    }
+    const pc: PlanClient | null = this.planClient
+    if (p === POOL_READ && !r.solo && pc !== null) {
+      const kind: i32 = this.planKind(r)
+      if (kind >= 0) {
+        // The plan service plans it with every worker's reads.
+        const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE ? F_PATH : F_FILTER
+        this.wait(r, p)
+        r.inPlan = true
+        pc.request(r.index, kind, r.viewer, r.limit, r.offset, r.text, r.fStart[f], r.fLen[f])
+        return
+      }
     }
     if (p === POOL_READ && !r.solo && this.planKind(r) >= 0) {
       // The tag list, lists, feeds, articles and comments wait for the next read plan: `startPlans` takes them.
@@ -1842,6 +1896,7 @@ export class ConduitWorker {
         }
       }
     }
+    this.planFlush()
     // The writes `bindAll` held back go again once what waited has been sent.
     while (this.deferred.length > 0) {
       let k: i32 = this.deferred[this.deferred.length - 1]
@@ -1865,6 +1920,9 @@ export class ConduitWorker {
   batchWrites(): void {
     const pool: PgPool = this.pools[POOL_WRITE]
     while (this.writeCount > 0 && this.writeBatches < pool.size) {
+      if (this.writeWaitLeft() > 0) {
+        return
+      }
       const ticket: i32 = pool.request()
       if (ticket === PG_POOL_FULL) {
         return
@@ -1889,6 +1947,15 @@ export class ConduitWorker {
       this.writeCount -= take
       this.writeBatches += 1
     }
+  }
+
+  /** How long, in ns, the writes waiting should wait still for company: 0 once a batch's worth wait or the oldest has waited `writeWait`. */
+  writeWaitLeft(): i64 {
+    if (this.writeWait === 0 || this.writeCount === 0 || this.writeCount >= WRITE_BATCH) {
+      return 0
+    }
+    const left: i64 = this.writeAt[this.writeHead] + this.writeWait - monotonicNanos()
+    return left > 0 ? left : 0
   }
 
   /**
@@ -2921,6 +2988,124 @@ export class ConduitWorker {
    * busy. Several services each get the box's fair share of a core when
    * Postgres keeps every core busy, where one alone fell behind the logins.
    */
+  // ---- The plan service ------------------------------------------------------------
+
+  planConnect(): void {
+    const c: PlanClient | null = this.planClient
+    if (c === null) {
+      return
+    }
+    const fd: i32 = tcpConnect(c.address)
+    if (fd < 0 || pollAdd(this.loop, fd, H1_WANT_WRITE, TOKEN_PLAN) < 0) {
+      if (fd >= 0) {
+        netClose(fd)
+      }
+      // The service may still be starting: tried again shortly; its reads wait in the output meanwhile.
+      c.retryAt = monotonicNanos() + 50000000
+      return
+    }
+    c.stream.fd = fd
+    c.stream.armed = H1_WANT_WRITE
+    c.connected = false
+  }
+
+  planTick(): void {
+    const c: PlanClient | null = this.planClient
+    if (c !== null && c.retryAt > 0 && c.fd() < 0 && monotonicNanos() >= c.retryAt) {
+      c.retryAt = 0
+      this.planConnect()
+    }
+  }
+
+  /** Sends the reads queued for the plan service, and arms its socket for what is left. */
+  planFlush(): void {
+    const c: PlanClient | null = this.planClient
+    if (c === null || c.fd() < 0 || !c.connected) {
+      return
+    }
+    if (!c.send()) {
+      this.planLost()
+      return
+    }
+    const wants: i32 = c.waiting() ? H1_WANT_READ | H1_WANT_WRITE : H1_WANT_READ
+    if (wants !== c.stream.armed) {
+      c.stream.armed = wants
+      pollModify(this.loop, c.fd(), wants, TOKEN_PLAN)
+    }
+  }
+
+  /**
+   * The plan service went away: what it held may never be answered, so each
+   * read it held is read alone here, and the service is tried again.
+   */
+  planLost(): void {
+    const c: PlanClient | null = this.planClient
+    if (c === null) {
+      return
+    }
+    if (c.fd() >= 0) {
+      pollRemove(this.loop, c.fd())
+      netClose(c.fd())
+    }
+    c.reset()
+    c.retryAt = monotonicNanos() + 50000000
+    for (const r of this.reqs) {
+      if (r.inPlan) {
+        r.inPlan = false
+        r.inPool = false
+        r.solo = true
+        this.submit(r, true)
+      }
+    }
+  }
+
+  planReady(events: i32): void {
+    const c: PlanClient | null = this.planClient
+    if (c === null || c.fd() < 0) {
+      return
+    }
+    if (!c.connected) {
+      if (connectResult(c.fd()) !== 0) {
+        pollRemove(this.loop, c.fd())
+        netClose(c.fd())
+        c.stream.fd = -1
+        c.retryAt = monotonicNanos() + 50000000
+        return
+      }
+      c.connected = true
+    }
+    if ((events & READABLE) !== 0) {
+      if (!c.receive()) {
+        this.planLost()
+        return
+      }
+      while (c.nextReply()) {
+        const ri: i32 = c.replyId
+        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inPlan) {
+          this.onPlan(this.reqs[ri], c)
+        }
+      }
+    }
+    this.planFlush()
+  }
+
+  /** A read's answer from the plan service. */
+  onPlan(r: ConduitReq, c: PlanClient): void {
+    r.inPlan = false
+    r.inPool = false
+    const status: i32 = c.replyStatus
+    if (status === PLAN_REPLY_ALONE) {
+      r.solo = true
+      this.submit(r, true)
+    } else if (status === 404) {
+      this.fail(r, 404, r.route === R_COMMENTS ? "article not found" : "not found", true)
+    } else if (status === 200) {
+      this.answerAt(r, 200, c.input(), c.replyStart, c.replyLength, true)
+    } else {
+      this.fail(r, 500, "the database connection was lost", true)
+    }
+  }
+
   bcryptPick(): i32 {
     let up: boolean = false
     for (const c of this.bcrypts) {

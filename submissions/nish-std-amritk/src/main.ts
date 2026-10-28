@@ -22,8 +22,10 @@
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
+import { secret, wipe } from "nish:secret"
 import { runBcryptService } from "./bcrypt-service"
-import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
+import { PlanServiceConfig, runPlanService } from "./plan-service"
+import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig, pgConfig } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
 const LISTEN_FLAGS: i32 = 3
@@ -82,6 +84,14 @@ const readDatabaseUrl = (url: string, cfg: WorkerConfig): boolean => {
   return cfg.dbUser.length > 0 && cfg.dbName.length > 0 && cfg.dbPort > 0
 }
 
+const bytesOfString = (s: string): u8[] => {
+  const out: u8[] = new Array<u8>(s.length)
+  for (let k: i32 = 0; k < toI32(s.length) && k < toI32(out.length); k++) {
+    out[k] = toU8(s.charCodeAt(k))
+  }
+  return out
+}
+
 export const main = (): i32 => {
   const cfg = new WorkerConfig()
   if (!readDatabaseUrl(getenv("DATABASE_URL") ?? "", cfg)) {
@@ -94,7 +104,11 @@ export const main = (): i32 => {
   }
   cfg.host = getenv("HOST") ?? "0.0.0.0"
   cfg.port = envInt("PORT", 3000)
-  cfg.readConns = envInt("DB_READ_CONNS", 3)
+  cfg.planService = (getenv("PLAN_SERVICE") ?? "0") === "1"
+  cfg.planPort = envInt("PLAN_PORT", 47390)
+  cfg.writeWaitUs = envInt("WRITE_WAIT_US", 0)
+  // With the plans in the plan service, a worker reads alone only what a plan does not answer.
+  cfg.readConns = envInt("DB_READ_CONNS", cfg.planService ? 1 : 3)
   cfg.writeConns = envInt("DB_WRITE_CONNS", 1)
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
@@ -115,11 +129,29 @@ export const main = (): i32 => {
   const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
   cfg.bcryptServices = services > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : services
   const prefork = new PreforkConfig()
-  prefork.workers = http + cfg.bcryptServices
+  prefork.workers = http + cfg.bcryptServices + (cfg.planService ? 1 : 0)
   prefork.restart = false
   const index: i32 = preforkWith(process.argv, prefork)
   if (index < 0) {
     return index === PREFORK_STOPPED ? 0 : 1
+  }
+  if (index === http + cfg.bcryptServices) {
+    const listener: i32 = tcpListenFlags("127.0.0.1", cfg.planPort, 1024, 2)
+    if (listener < 0) {
+      console.log(`conduit: the plan service cannot listen on 127.0.0.1:${cfg.planPort} (${listener})`)
+      return 1
+    }
+    const plan = new PlanServiceConfig()
+    plan.pg = pgConfig(cfg, 1)
+    plan.host = cfg.dbHost
+    plan.port = cfg.dbPort
+    plan.conns = envInt("PLAN_CONNS", 5)
+    plan.planMin = envInt("PLAN_MIN", 256)
+    plan.planWaitUs = envInt("PLAN_WAIT_US", 5000)
+    const password = secret(bytesOfString(cfg.dbPassword))
+    const code: i32 = runPlanService(plan, listener, password)
+    wipe(password)
+    return code
   }
   if (index >= http) {
     const port: i32 = cfg.bcryptPort + index - http

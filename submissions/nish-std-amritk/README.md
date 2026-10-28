@@ -184,6 +184,46 @@ services listen on it and the ports above) and
 `IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that makes 16 PostgreSQL
 connections in all, inside the limit of 95.
 
+## Experiments, off by default
+
+Two settings from the newer submissions, built in but off until they are
+measured on a VM like the box:
+
+- `PLAN_SERVICE=1` runs the read plans in a process of their own
+  (`src/plan-service.ts`), which owns the box's read connections
+  (`PLAN_CONNS`, 5) and gathers the reads of every HTTP worker into one queue
+  (`PLAN_WAIT_US`, 5000; `PLAN_MIN`, 256), so a plan holds the whole box's
+  reads rather than one worker's. Each worker sends it a framed read over
+  loopback TCP and gets back the answer's JSON; a worker keeps one read
+  connection of its own for what a plan does not answer. One queue for the
+  box, in a process of its own, is the "drain" of
+  [zig-iouring-nick-potts](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/zig-iouring-nick-potts)
+  ([#79](https://github.com/arjaythedev/multicore-server-challenge/pull/79));
+  [#118](https://github.com/arjaythedev/multicore-server-challenge/pull/118)
+  shares one queue between its loops too.
+- `WRITE_WAIT_US=3000` makes a write that finds the write connection idle
+  wait up to 3 ms for others to join its group commit, also from #79.
+
+On the 4-core container below (method as below, two HTTP workers unless
+noted), both pass the 197 conformance checks:
+
+| Users | Build | req/s | p95 | p99 | Postgres CPU / req | app CPU / req |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 8,000 | 4 workers | 18,303 | 117 ms | 209 ms | 107 µs | 58 µs |
+| 8,000 | 4 workers, plan service | 18,416 | 104 ms | 160 ms | 94 µs | 58 µs |
+| 11,000 | 4 workers | 19,247 | 331 ms | 469 ms | 98 µs | 62 µs |
+| 11,000 | 4 workers, plan service | 18,713 | 357 ms | 530 ms | 92 µs | 67 µs |
+| 11,000 | 2 workers | 21,376 | 247 ms | 323 ms | 83 µs | 57 µs |
+| 11,000 | 2 workers, plan service | 20,866 | 261 ms | 381 ms | 82 µs | 60 µs |
+
+With four workers, as on the box, one queue takes 6–12% off Postgres's CPU
+per request; the loopback round trip adds 3–7 µs of the server's, and on
+this container, where the load generator shares the four CPUs, throughput
+at saturation came out level or a little lower. With two workers, one queue
+at 5 ms gathers what two at 10 ms did, so it saves nothing. The write wait
+measured within the noise (Postgres 88–94 µs a request against 94 µs at
+8,000 users; at 11,000, 21,466 and 19,496 req/s against 20,257 and 19,199).
+
 ## Measured
 
 These figures are local, not official scores. They come from a 4-core
