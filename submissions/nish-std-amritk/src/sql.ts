@@ -245,6 +245,22 @@ export const registerStatements = (pool: PgPool): boolean => {
       "DELETE FROM favorites f USING articles a WHERE f.user_id = $1 AND f.article_id = a.id AND a.slug = $2",
       none
     ) && ok
+  // A write batch's favorites and unfavorites, each kind one statement over
+  // the batch's (viewer, slug) pairs; each request then reads its article.
+  ok =
+    pool.register(
+      "favorite_many",
+      "INSERT INTO favorites (user_id, article_id) SELECT q.v, a.id FROM unnest($1::int8[], $2::text[]) q(v, slug) " +
+        "JOIN articles a ON a.slug = q.slug ON CONFLICT DO NOTHING",
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "unfavorite_many",
+      "DELETE FROM favorites f USING unnest($1::int8[], $2::text[]) q(v, slug), articles a " +
+        "WHERE a.slug = q.slug AND f.user_id = q.v AND f.article_id = a.id",
+      none
+    ) && ok
   // Comments: the article and its newest comments in one statement, one row
   // with the comment columns NULL when it has none, and no row when the
   // article does not exist.
@@ -396,14 +412,16 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
     ) && ok
   // The flags: (0, viewer, article) for each favorite asked about that
   // exists, (1, viewer, user) for each follow; each viewer's in one range
-  // scan of the primary key over its ids.
+  // scan of the primary key over its ids. Each viewer's ids come as one
+  // `int8[]` literal, grouped by the plan: regrouping (viewer, id) pairs
+  // here took half the statement's time.
   ok =
     pool.register(
       "plan_flags",
-      "SELECT 0::int8, g.v, f.article_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($1::int8[], $2::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids)) f " +
-        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($3::int8[], $4::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids)) fo",
+      "SELECT 0::int8, g.v, f.article_id FROM unnest($1::int8[], $2::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids::int8[])) f " +
+        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM unnest($1::int8[], $3::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids::int8[])) fo",
       none
     ) && ok
   return ok
@@ -412,6 +430,10 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
 /** A plan's batcher of articles by slug: each distinct slug's id and author, no row when there is none. */
 export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
   planBatch("plan_article", "SELECT a.id, a.author_id FROM articles a WHERE a.slug = q.key", "", maxRequests)
+
+/** A plan's batcher of profiles by username: the user's id and profile, no row when there is none. */
+export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
+  planBatch("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
 
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with

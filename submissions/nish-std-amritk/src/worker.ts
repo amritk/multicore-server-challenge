@@ -1,6 +1,6 @@
 // One HTTP worker: a single-threaded `pollWait` loop holding its share of the
 // listener (SO_REUSEPORT), every keep-alive connection the kernel gives it,
-// two `PgPool`s (reads and writes) and one connection to the bcrypt service.
+// two `PgPool`s (reads and writes) and one connection to each bcrypt service.
 // It is tests/postgres/carrier.ts's shape, with the Conduit API on top.
 //
 // A request is parsed when its head arrives and checked when its body ends:
@@ -103,6 +103,7 @@ import {
   K_FAVORITED,
   K_FEED,
   K_GLOBAL,
+  K_PROFILE,
   K_TAG,
   K_TAGS,
   PLAN_ALONE,
@@ -191,10 +192,14 @@ const FIELDS_COMMENT: i32 = 64 // body
 const POOL_READ: i32 = 0
 const POOL_WRITE: i32 = 1
 
-/** Tokens in the loop: the listener, the bcrypt service, then pool slots below; HTTP slots are 0 and up. */
+/** Tokens in the loop: the listener, the bcrypt services (-2 down), then pool slots below; HTTP slots are 0 and up. */
 const TOKEN_LISTENER: i32 = -1
 const TOKEN_BCRYPT: i32 = -2
 const TOKEN_POOL: i32 = -16
+/** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_POOL`. */
+export const BCRYPT_SERVICES_MAX: i32 = 14
+/** The jobs one bcrypt call takes (`bcryptHash4`, `bcryptVerify4`). */
+const BCRYPT_LANES: i32 = 4
 const POOL_TOKENS: i32 = 1024
 
 const AGAIN: i32 = -11
@@ -313,6 +318,12 @@ class ConduitReq {
   batchNext: i32 = -1
   /** A write sent alone, after its batch failed; a read sent alone, outside a read plan. */
   solo: boolean = false
+  /** A favorite or unfavorite whose write its batch's `favorite_many` or `unfavorite_many` makes: it reads its article only. */
+  folded: boolean = false
+  /** On a batch's first request: how many statements bound before its own, which answer no request. */
+  prefix: i32 = 0
+  /** The bcrypt service its password went to, while `inBcrypt`. */
+  bcryptAt: i32 = -1
   /** A batched write's own answer: its writer and the buffer it writes. */
   own: u8[]
   ownWriter: JsonWriter
@@ -362,6 +373,8 @@ class ConduitReq {
     this.pgError = 0
     this.batchNext = -1
     this.solo = false
+    this.folded = false
+    this.prefix = 0
   }
 
   /**
@@ -517,8 +530,12 @@ export class WorkerConfig {
    */
   planMin: i32 = 256
   planWaitUs: i32 = 10000
-  planClock: boolean = true
+  /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
+  planClock: i32 = 1
+  planLight: i32 = 32
   bcryptPort: i32 = 47391
+  /** How many bcrypt services listen, on `bcryptPort` and up. */
+  bcryptServices: i32 = 1
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
@@ -532,9 +549,12 @@ const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
   config.applicationName = "conduit-nish"
   // Session settings at startup, for every connection: generic plans for
   // the prepared statements, no JIT and no parallel workers (one request
-  // is small), and the ISO and UTC spelling the connection reads.
+  // is small), no Memoize (a generic plan put one on the comment authors'
+  // lookup, whose cache is emptied every execution: 2 hits in 351, and the
+  // comments statement 7-12% slower with it), and the ISO and UTC spelling
+  // the connection reads.
   config.options =
-    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c DateStyle=ISO -c TimeZone=UTC"
+    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c DateStyle=ISO -c TimeZone=UTC"
   config.maxInFlight = maxInFlight
   config.inputSize = 65536
   config.maxOutput = PG_MAX_OUTPUT
@@ -575,11 +595,8 @@ export class ConduitWorker {
   fragments: u8[][]
   stringColumns: i32[]
   tokenBuf: u8[]
-  bcrypt: BcryptClient
-  bcryptAddress: u8[]
-  /** When a bcrypt connect last failed, for the retry; 0 while none has. */
-  bcryptFailedAt: i64 = 0
-  bcryptRetryAt: i64 = 0
+  /** One client a bcrypt service. */
+  bcrypts: BcryptClient[]
   /** Requests answered, for a reader of `/proc`. */
   answered: i64 = 0
   /** Writes waiting for the next batch, a ring oldest first; and how many batches are in flight. */
@@ -589,8 +606,9 @@ export class ConduitWorker {
   writeBatches: i32 = 0
   /** The chains of writes `bindAll` held back this pump, by their first request. */
   deferred: i32[]
-  /** Per write-pool slot: the request of its batch whose statements are being answered. */
+  /** Per write-pool slot: the request of its batch whose statements are being answered, and the batch's statements before it left. */
   writeCursor: i32[]
+  writePrefix: i32[]
   /** The read plans, each one's `PLAN_` state, and the reads waiting for the next, a ring oldest first. */
   plans: ReadPlan[]
   planState: i32[]
@@ -603,8 +621,13 @@ export class ConduitWorker {
   planAt: i64[]
   planMin: i32 = 256
   planWait: i64 = 0
-  /** Whether the window gathers reads even while no plan runs: a batch clock. */
-  planClock: boolean = true
+  /** Whether the window gathers reads even while no plan runs: a batch clock (`WorkerConfig.planClock`). */
+  planClock: i32 = 1
+  planLight: i64 = 32
+  /** Reads that came for plans since `rateAt`, and how many came a window over the last measure. */
+  arrivals: i64 = 0
+  rateAt: i64 = 0
+  perWindow: i64 = 0
 
   constructor(cfg: WorkerConfig, listener: i32) {
     this.listener = listener
@@ -692,11 +715,17 @@ export class ConduitWorker {
     ]
     this.stringColumns = [COL_SLUG, COL_TITLE, COL_DESCRIPTION, COL_BODY, COL_USERNAME, COL_BIO, COL_IMAGE]
     this.tokenBuf = new Array<u8>(512)
-    this.bcrypt = new BcryptClient()
-    this.bcryptAddress = new Array<u8>(18)
+    this.bcrypts = []
+    const services: i32 = cfg.bcryptServices < 1 ? 1 : cfg.bcryptServices > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : cfg.bcryptServices
+    for (let k: i32 = 0; k < services; k++) {
+      const c = new BcryptClient()
+      netAddress(c.address, "127.0.0.1", cfg.bcryptPort + k)
+      this.bcrypts.push(c)
+    }
     this.writeRing = new Array<i32>(QUEUE)
     this.deferred = []
     this.writeCursor = new Array<i32>(this.pools[POOL_WRITE].size)
+    this.writePrefix = new Array<i32>(this.pools[POOL_WRITE].size)
     registerPlanStatements(this.pools[POOL_READ])
     this.plans = []
     this.planState = []
@@ -708,16 +737,17 @@ export class ConduitWorker {
     const noTypes: i32[] = []
     this.pools[POOL_READ].register(this.plans[0].articles.name, this.plans[0].articles.sql, noTypes)
     this.pools[POOL_READ].register(this.plans[0].comments.name, this.plans[0].comments.sql, noTypes)
+    this.pools[POOL_READ].register(this.plans[0].profiles.name, this.plans[0].profiles.sql, noTypes)
     this.planRing = new Array<i32>(QUEUE)
     this.planAt = new Array<i64>(QUEUE)
     this.planMin = cfg.planMin
     this.planWait = toI64(cfg.planWaitUs) * 1000
     this.planClock = cfg.planClock
+    this.planLight = toI64(cfg.planLight)
     this.ticketPlan = new Array<i32>(TICKET_RING)
     for (let k: i32 = 0; k < TICKET_RING; k++) {
       this.ticketPlan[k] = -1
     }
-    netAddress(this.bcryptAddress, "127.0.0.1", cfg.bcryptPort)
   }
 
   // ---- The loop -------------------------------------------------------------------
@@ -725,9 +755,13 @@ export class ConduitWorker {
   /** Serves until the process is stopped; answers 1 when the loop fails. */
   run(): i32 {
     const ready: i32[] = new Array<i32>(2 * 512)
+    this.bcryptStart()
     while (true) {
       this.pump()
-      let wait: i32 = this.bcryptRetryAt > 0 ? 50 : 1000
+      let wait: i32 = 1000
+      for (const c of this.bcrypts) {
+        wait = c.retryAt > 0 ? 50 : wait
+      }
       const left: i64 = this.planWaitLeft()
       if (left > 0) {
         // Woken when the oldest read's window ends, to the millisecond above.
@@ -759,8 +793,11 @@ export class ConduitWorker {
       }
     } else if (token === TOKEN_LISTENER) {
       this.acceptAll()
-    } else if (token === TOKEN_BCRYPT) {
-      this.bcryptReady(events)
+    } else if (token <= TOKEN_BCRYPT && token > TOKEN_POOL) {
+      const k: i32 = TOKEN_BCRYPT - token
+      if (k < toI32(this.bcrypts.length)) {
+        this.bcryptReady(k, events)
+      }
     } else {
       const n: i32 = TOKEN_POOL - token
       const p: i32 = n / POOL_TOKENS
@@ -1479,8 +1516,10 @@ export class ConduitWorker {
       }
       const at: i32 = (this.planHead + this.planCount) % QUEUE
       this.planRing[at] = r.index
-      this.planAt[at] = monotonicNanos()
+      const now: i64 = monotonicNanos()
+      this.planAt[at] = now
       this.planCount += 1
+      this.arrived(now)
       return
     }
     const ticket: i32 = this.pools[p].request()
@@ -1512,6 +1551,9 @@ export class ConduitWorker {
       return K_TAGS
     } else if (r.route === R_ARTICLE_GET || r.route === R_COMMENTS) {
       kind = r.route === R_ARTICLE_GET ? K_ARTICLE : K_COMMENTS
+      f = F_PATH
+    } else if (r.route === R_PROFILE) {
+      kind = K_PROFILE
       f = F_PATH
     } else {
       return -1
@@ -1547,7 +1589,7 @@ export class ConduitWorker {
       while (this.planCount > 0) {
         const r: ConduitReq = this.reqs[this.planRing[this.planHead]]
         const kind: i32 = this.planKind(r)
-        const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS ? F_PATH : F_FILTER
+        const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE ? F_PATH : F_FILTER
         if (!plan.add(r.index, kind, r.viewer, r.limit, r.offset, r.text, r.fStart[f], r.fLen[f])) {
           break
         }
@@ -1571,7 +1613,13 @@ export class ConduitWorker {
     if (this.planCount === 0 || this.planCount >= this.planMin) {
       return 0
     }
-    let busy: boolean = this.planClock
+    // An adaptive clock gathers only while enough reads come to fill a plan
+    // worth the wait; a quiet worker (or one quiet for 50 ms) starts at once.
+    let busy: boolean =
+      this.planClock === 1 ||
+      (this.planClock === 2 &&
+        this.perWindow >= this.planLight &&
+        monotonicNanos() - this.rateAt < toI64(2) * this.measureSpan())
     for (let p: i32 = 0; p < toI32(this.planState.length); p++) {
       busy = busy || this.planState[p] !== PLAN_FREE
     }
@@ -1580,6 +1628,27 @@ export class ConduitWorker {
     }
     const left: i64 = this.planAt[this.planHead] + this.planWait - monotonicNanos()
     return left > 0 ? left : 0
+  }
+
+  /**
+   * Counts a read that came for a plan, and every 50 ms (or a window, when
+   * longer) measures how many come a window: what an adaptive clock
+   * (`planClock` 2) gathers by.
+   */
+  arrived(now: i64): void {
+    this.arrivals += 1
+    const span: i64 = now - this.rateAt
+    if (span >= this.measureSpan()) {
+      this.perWindow = span > 0 ? (this.arrivals * this.planWait) / span : 0
+      this.arrivals = 0
+      this.rateAt = now
+    }
+  }
+
+  /** How long the arrival rate is measured over, in ns: 50 ms, or a window when longer. */
+  measureSpan(): i64 {
+    const floor: i64 = 50000000
+    return this.planWait > floor ? this.planWait : floor
   }
 
   /** Plan `p`'s group ended: after group A, asks for group B when it has anything to read, else answers. */
@@ -1829,6 +1898,15 @@ export class ConduitWorker {
    * refused.
    */
   bindAll(r: ConduitReq, conn: PgConnection): boolean {
+    r.prefix = 0
+    if (r.pool === POOL_WRITE && !r.solo && r.batchNext >= 0) {
+      if (!this.foldFavorites(r, conn)) {
+        return false
+      }
+    } else {
+      // Alone (a write sent again after its batch failed, too), it makes its own write.
+      r.folded = false
+    }
     let prev: i32 = -1
     let k: i32 = r.index
     while (k >= 0) {
@@ -1859,12 +1937,107 @@ export class ConduitWorker {
     return true
   }
 
+  /**
+   * Folds the favorites and unfavorites of the batch `r` leads into one
+   * statement of each kind, bound before the batch's own: a folded request
+   * then reads its article only. A request is folded only when its slug is
+   * text and no other favorite or unfavorite of the batch has its viewer, so
+   * the order of one viewer's toggles is the order they came in. Both writes
+   * are idempotent: one the batch holds back (`bindAll`) and sends again
+   * gets the same answer. False when a bind was refused.
+   */
+  foldFavorites(r: ConduitReq, conn: PgConnection): boolean {
+    let k: i32 = r.index
+    let n: i32 = 0
+    while (k >= 0) {
+      const m: ConduitReq = this.reqs[k]
+      m.folded = false
+      if (m.route === R_FAVORITE || m.route === R_UNFAVORITE) {
+        n += 1
+      }
+      k = m.batchNext
+    }
+    if (n < 2) {
+      return true
+    }
+    let folds: i32 = 0
+    k = r.index
+    while (k >= 0) {
+      const m: ConduitReq = this.reqs[k]
+      if (m.route === R_FAVORITE || m.route === R_UNFAVORITE) {
+        const start: i32 = m.fStart[F_PATH]
+        const len: i32 = m.fLen[F_PATH]
+        let alone: boolean = len > 0 && len <= PLAN_KEY_MAX && isText(m.text, start, start + len)
+        let j: i32 = r.index
+        while (alone && j >= 0) {
+          const o: ConduitReq = this.reqs[j]
+          if (j !== k && (o.route === R_FAVORITE || o.route === R_UNFAVORITE) && o.viewer === m.viewer) {
+            alone = false
+          }
+          j = o.batchNext
+        }
+        m.folded = alone
+        folds += alone ? 1 : 0
+      }
+      k = m.batchNext
+    }
+    if (folds < 2) {
+      k = r.index
+      while (k >= 0) {
+        this.reqs[k].folded = false
+        k = this.reqs[k].batchNext
+      }
+      return true
+    }
+    for (let kind: i32 = 0; kind < 2; kind++) {
+      const route: i32 = kind === 0 ? R_FAVORITE : R_UNFAVORITE
+      let any: boolean = false
+      k = r.index
+      while (k >= 0 && !any) {
+        any = this.reqs[k].folded && this.reqs[k].route === route
+        k = this.reqs[k].batchNext
+      }
+      if (!any) {
+        continue
+      }
+      if (!conn.bindStart(kind === 0 ? "favorite_many" : "unfavorite_many") || !conn.arrayStart()) {
+        return false
+      }
+      for (let half: i32 = 0; half < 2; half++) {
+        if (half === 1 && !conn.arrayStart()) {
+          return false
+        }
+        k = r.index
+        while (k >= 0) {
+          const m: ConduitReq = this.reqs[k]
+          if (m.folded && m.route === route) {
+            const ok: boolean =
+              half === 0
+                ? conn.arrayInt(m.viewer)
+                : conn.arrayElement(m.text, m.fStart[F_PATH], m.fLen[F_PATH])
+            if (!ok) {
+              conn.arrayEnd()
+              return false
+            }
+          }
+          k = m.batchNext
+        }
+        conn.arrayEnd()
+      }
+      if (!conn.bindEnd()) {
+        return false
+      }
+      r.prefix += 1
+    }
+    return true
+  }
+
   /** How many statements `r`'s group runs, so a batch knows where each request's answers end. */
   statements(r: ConduitReq): i32 {
     switch (r.route) {
       case R_FAVORITE:
       case R_UNFAVORITE:
-        return 2
+        return r.folded ? 1 : 2
       case R_ARTICLE_CREATE:
         return r.tags > 0 ? 4 : 2
       case R_ARTICLE_PUT:
@@ -2030,6 +2203,7 @@ export class ConduitWorker {
     if (this.current[POOL_WRITE][s] !== ticket) {
       this.current[POOL_WRITE][s] = ticket
       this.writeCursor[s] = leader
+      this.writePrefix[s] = this.reqs[leader].prefix
       const first: ConduitReq = this.reqs[leader]
       first.ownRoom(64)
       this.begin(first, first.ownWriter, first.own)
@@ -2058,6 +2232,14 @@ export class ConduitWorker {
           m.solo = true
           this.submit(m, true)
         }
+      }
+      return
+    }
+    if (this.writePrefix[s] > 0) {
+      // The folded favorites' and unfavorites' statements answer no request;
+      // one that fails fails the group, whose writes are then sent alone.
+      if (event === PG_COMPLETE || event === PG_ERROR) {
+        this.writePrefix[s] -= 1
       }
       return
     }
@@ -2201,10 +2383,11 @@ export class ConduitWorker {
       case R_FAVORITE:
       case R_UNFAVORITE:
         ok =
-          conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
-          conn.paramInt(r.viewer) &&
-          this.text(conn, r, F_PATH) &&
-          conn.bindEnd() &&
+          (r.folded ||
+            (conn.bindStart(r.route === R_FAVORITE ? "favorite" : "unfavorite") &&
+              conn.paramInt(r.viewer) &&
+              this.text(conn, r, F_PATH) &&
+              conn.bindEnd())) &&
           conn.bindStart("article_slug") &&
           conn.paramInt(r.viewer) &&
           this.text(conn, r, F_PATH) &&
@@ -2315,7 +2498,8 @@ export class ConduitWorker {
         break
       case R_FAVORITE:
       case R_UNFAVORITE:
-        if (r.stmt === 1) {
+        // Folded, the article read is its first statement: the write was its batch's.
+        if (r.stmt === (r.folded ? 0 : 1)) {
           this.mainArticle(r, w, conn)
         }
         break
@@ -2717,18 +2901,51 @@ export class ConduitWorker {
 
   // ---- bcrypt ---------------------------------------------------------------------
 
-  /** Sends `r`'s password to the bcrypt service: a new hash, or a check against `F_HASH`. */
+  /**
+   * The bcrypt service the next job goes to: the one whose batch is the
+   * closest to full without being full, so a service's four lanes fill
+   * before the next is given work; and while every batch is full, the least
+   * busy. Several services each get the box's fair share of a core when
+   * Postgres keeps every core busy, where one alone fell behind the logins.
+   */
+  bcryptPick(): i32 {
+    let up: boolean = false
+    for (const c of this.bcrypts) {
+      up = up || !c.down
+    }
+    let best: i32 = -1
+    let bestPart: i32 = 0
+    let idle: i32 = -1
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      const c: BcryptClient = this.bcrypts[k]
+      if (up && c.down) {
+        continue
+      }
+      const part: i32 = c.inFlight % BCRYPT_LANES
+      if (part > bestPart) {
+        bestPart = part
+        best = k
+      }
+      if (idle < 0 || c.inFlight < this.bcrypts[idle].inFlight) {
+        idle = k
+      }
+    }
+    return best >= 0 ? best : idle
+  }
+
+  /** Connects to every bcrypt service at start, so one that is not there is known down before a login needs it. */
+  bcryptStart(): void {
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      this.bcryptConnect(k)
+    }
+  }
+
+  /** Sends `r`'s password to a bcrypt service: a new hash, or a check against `F_HASH`. */
   toBcrypt(r: ConduitReq, op: i32, later: boolean): void {
+    const k: i32 = this.bcryptPick()
+    const c: BcryptClient = this.bcrypts[k]
     const hashLen: i32 = op === BCRYPT_OP_VERIFY ? r.fLen[F_HASH] : 0
-    const queued: boolean = this.bcrypt.request(
-      op,
-      r.index,
-      r.pw,
-      r.pwLen,
-      r.text,
-      r.fStart[F_HASH],
-      hashLen < 0 ? 0 : hashLen
-    )
+    const queued: boolean = c.request(op, r.index, r.pw, r.pwLen, r.text, r.fStart[F_HASH], hashLen < 0 ? 0 : hashLen)
     wipe(r.pw)
     r.pwLen = -1
     if (!queued) {
@@ -2736,33 +2953,33 @@ export class ConduitWorker {
       return
     }
     r.inBcrypt = true
-    if (this.bcrypt.fd < 0) {
-      this.bcryptConnect()
-    } else if (this.bcrypt.connected) {
-      if (!this.bcrypt.send()) {
-        this.bcryptLost()
+    r.bcryptAt = k
+    c.inFlight += 1
+    if (c.fd < 0) {
+      if (c.retryAt === 0) {
+        this.bcryptConnect(k)
+      }
+    } else if (c.connected) {
+      if (!c.send()) {
+        this.bcryptLost(k)
       } else {
-        pollModify(
-          this.loop,
-          this.bcrypt.fd,
-          this.bcrypt.outputEnd > this.bcrypt.outputStart ? 3 : 1,
-          TOKEN_BCRYPT
-        )
+        pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT - k)
       }
     }
   }
 
-  bcryptConnect(): void {
-    const fd: i32 = tcpConnect(this.bcryptAddress)
-    if (fd < 0 || pollAdd(this.loop, fd, H1_WANT_WRITE, TOKEN_BCRYPT) < 0) {
+  bcryptConnect(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
+    const fd: i32 = tcpConnect(c.address)
+    if (fd < 0 || pollAdd(this.loop, fd, H1_WANT_WRITE, TOKEN_BCRYPT - k) < 0) {
       if (fd >= 0) {
         netClose(fd)
       }
-      this.bcryptRefused()
+      this.bcryptRefused(k)
       return
     }
-    this.bcrypt.fd = fd
-    this.bcrypt.connected = false
+    c.fd = fd
+    c.connected = false
   }
 
   /**
@@ -2770,44 +2987,57 @@ export class ConduitWorker {
    * output and the connect is tried again shortly, for `BCRYPT_PATIENCE`
    * (the service may still be starting); then they fail.
    */
-  bcryptRefused(): void {
+  bcryptRefused(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
     const now: i64 = monotonicNanos()
-    if (this.bcryptFailedAt === 0) {
-      this.bcryptFailedAt = now
-    }
-    if (now - this.bcryptFailedAt > BCRYPT_PATIENCE) {
-      this.bcryptFailedAt = 0
-      this.bcryptRetryAt = 0
-      this.bcryptLost()
+    if (c.down) {
+      // Tried again once a second; its jobs went to the others meanwhile.
+      c.retryAt = now + 1000000000
       return
     }
-    this.bcryptRetryAt = now + 50000000
+    if (c.failedAt === 0) {
+      c.failedAt = now
+    }
+    if (now - c.failedAt > BCRYPT_PATIENCE) {
+      c.failedAt = 0
+      this.bcryptLost(k)
+      c.down = true
+      c.retryAt = now + 1000000000
+      return
+    }
+    c.retryAt = now + 50000000
   }
 
   bcryptTick(): void {
-    if (this.bcryptRetryAt > 0 && monotonicNanos() >= this.bcryptRetryAt && this.bcrypt.fd < 0) {
-      this.bcryptRetryAt = 0
-      this.bcryptConnect()
+    const now: i64 = monotonicNanos()
+    for (let k: i32 = 0; k < toI32(this.bcrypts.length); k++) {
+      const c: BcryptClient = this.bcrypts[k]
+      if (c.retryAt > 0 && now >= c.retryAt && c.fd < 0) {
+        c.retryAt = 0
+        this.bcryptConnect(k)
+      }
     }
   }
 
-  /** The service went away with requests on it: they fail, since their passwords are gone. */
-  bcryptLost(): void {
-    if (this.bcrypt.fd >= 0) {
-      pollRemove(this.loop, this.bcrypt.fd)
-      netClose(this.bcrypt.fd)
+  /** Service `k` went away with requests on it: they fail, since their passwords are gone. */
+  bcryptLost(k: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
+    if (c.fd >= 0) {
+      pollRemove(this.loop, c.fd)
+      netClose(c.fd)
     }
-    this.bcrypt.reset()
+    c.reset()
     for (const r of this.reqs) {
-      if (r.inBcrypt) {
+      if (r.inBcrypt && r.bcryptAt === k) {
         r.inBcrypt = false
+        r.bcryptAt = -1
         this.fail(r, 500, "the password service is unavailable", true)
       }
     }
   }
 
-  bcryptReady(events: i32): void {
-    const c: BcryptClient = this.bcrypt
+  bcryptReady(k: i32, events: i32): void {
+    const c: BcryptClient = this.bcrypts[k]
     if (c.fd < 0) {
       return
     }
@@ -2816,34 +3046,36 @@ export class ConduitWorker {
         pollRemove(this.loop, c.fd)
         netClose(c.fd)
         c.fd = -1
-        this.bcryptRefused()
+        this.bcryptRefused(k)
         return
       }
       c.connected = true
-      this.bcryptFailedAt = 0
+      c.failedAt = 0
+      c.down = false
     }
     if ((events & READABLE) !== 0) {
       if (!c.receive()) {
-        this.bcryptLost()
+        this.bcryptLost(k)
         return
       }
       while (c.nextReply()) {
         const ri: i32 = c.replyId
-        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inBcrypt) {
-          this.onBcrypt(this.reqs[ri])
+        if (ri >= 0 && ri < toI32(this.reqs.length) && this.reqs[ri].inBcrypt && this.reqs[ri].bcryptAt === k) {
+          c.inFlight -= 1
+          this.onBcrypt(this.reqs[ri], c)
         }
       }
     }
     if (!c.send()) {
-      this.bcryptLost()
+      this.bcryptLost(k)
       return
     }
-    pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT)
+    pollModify(this.loop, c.fd, c.outputEnd > c.outputStart ? 3 : 1, TOKEN_BCRYPT - k)
   }
 
-  onBcrypt(r: ConduitReq): void {
+  onBcrypt(r: ConduitReq, c: BcryptClient): void {
     r.inBcrypt = false
-    const c: BcryptClient = this.bcrypt
+    r.bcryptAt = -1
     if (r.route === R_LOGIN) {
       if (c.replyStatus !== BCRYPT_DONE) {
         this.fail(r, 401, "invalid credentials", true)

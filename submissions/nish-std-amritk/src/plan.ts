@@ -35,9 +35,9 @@ import {
 } from "nish/net/postgres"
 import { jsonOutBool, jsonOutNull, jsonOutRaw, jsonOutString, jsonOutWorst } from "./json-out"
 import { jwtDigits } from "./jwt"
-import { planArticleBatch, planCommentBatch } from "./sql"
+import { planArticleBatch, planCommentBatch, planProfileBatch } from "./sql"
 
-/** The kinds of request a plan answers: the five lists, an article and its comments by slug, and the tag list. */
+/** The kinds of request a plan answers: the five lists, an article and its comments by slug, the tag list, and a profile by username. */
 export const K_GLOBAL: i32 = 0
 export const K_TAG: i32 = 1
 export const K_AUTHOR: i32 = 2
@@ -46,8 +46,9 @@ export const K_FEED: i32 = 4
 export const K_ARTICLE: i32 = 5
 export const K_COMMENTS: i32 = 6
 export const K_TAGS: i32 = 7
+export const K_PROFILE: i32 = 8
 const LIST_KINDS: i32 = 5
-const KINDS: i32 = 8
+const KINDS: i32 = 9
 /** The largest tag id a plan places by rank; a plan that meets a larger one sends its requests alone. */
 const TAG_ID_MAX: i32 = 1048576
 
@@ -104,6 +105,12 @@ const C_AUTHOR: i32 = 5
 const C_USERNAME: i32 = 6
 const C_BIO: i32 = 7
 const C_IMAGE: i32 = 8
+
+/** A profile's columns in a `plan_profile` row. */
+const P_ID: i32 = 0
+const P_USERNAME: i32 = 1
+const P_BIO: i32 = 2
+const P_IMAGE: i32 = 3
 
 const planBytes = (s: string): u8[] => {
   const out: u8[] = new Array<u8>(s.length)
@@ -231,6 +238,19 @@ export class ReadPlan {
   askKind: i32[]
   askSlot: i32[]
   asks: i32 = 0
+  /**
+   * Each ask's viewer, as its place in `flagViewers` (the plan's distinct
+   * signed-in viewers); the place `ask` records; and the asks grouped by
+   * viewer and kind for `bindB` (`askOrder`, bucket `2 * place + kind`
+   * starting at `askStart[bucket]`), and the text of one viewer's ids.
+   */
+  askVi: i32[]
+  flagViewers: i64[]
+  flagViewerN: i32 = 0
+  private curVi: i32 = 0
+  private askOrder: i32[]
+  private askStart: i32[]
+  private flagText: u8[]
   private readonly askTable: i32[]
   /** Group A's statements in the order bound, and how many have completed; whether a statement failed. */
   readonly stmts: i32[]
@@ -240,11 +260,17 @@ export class ReadPlan {
   /** The batchers of articles and comments by slug, each distinct slug one key, `tag` its first request; and their runs. */
   articles: PgBatcher
   comments: PgBatcher
+  profiles: PgBatcher
   articleRun: i32 = -1
   commentRun: i32 = -1
+  profileRun: i32 = -1
   articleEnded: boolean = false
   commentEnded: boolean = false
-  /** Each request by slug: its article's id and author, or its comments' window of `cStart`.. and whether its article exists. */
+  profileEnded: boolean = false
+  /**
+   * Each request by slug: its article's id and author, or its comments' window of `cStart`.. and whether its article exists.
+   * A profile by username uses `slugId` for the user's id and `slugFound`.
+   */
   readonly slugId: i64[]
   readonly slugAuthor: i64[]
   readonly slugFound: boolean[]
@@ -255,6 +281,9 @@ export class ReadPlan {
   c1: i32[]
   cAuthor: i64[]
   commentsN: i32 = 0
+  /** Each profile key's JSON in `text`, `{"profile":{...,"following":`, as [pStart, pEnd). */
+  readonly pStart: i32[]
+  readonly pEnd: i32[]
   /**
    * Every tag, read once by the plan in name order: each id's rank in that
    * order (`tagRank`, valid where `tagStamp` is this plan's `gen`), each
@@ -326,10 +355,18 @@ export class ReadPlan {
     this.askId = new Array<i64>(4096)
     this.askKind = new Array<i32>(4096)
     this.askSlot = new Array<i32>(4096)
+    this.askVi = new Array<i32>(4096)
+    this.flagViewers = new Array<i64>(PLAN_MAX)
+    this.askOrder = new Array<i32>(4096)
+    this.askStart = new Array<i32>(2 * PLAN_MAX + 1)
+    this.flagText = new Array<u8>(4096)
     this.askTable = new Array<i32>(ID_TABLE)
     this.stmts = new Array<i32>(KINDS)
     this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
     this.comments = new PgBatcher(planCommentBatch(PLAN_MAX))
+    this.profiles = new PgBatcher(planProfileBatch(PLAN_MAX))
+    this.pStart = new Array<i32>(PLAN_MAX)
+    this.pEnd = new Array<i32>(PLAN_MAX)
     this.slugId = new Array<i64>(PLAN_MAX)
     this.slugAuthor = new Array<i64>(PLAN_MAX)
     this.slugFound = new Array<boolean>(PLAN_MAX)
@@ -371,6 +408,7 @@ export class ReadPlan {
       planBytes('","updatedAt":"'),
       planBytes('","body":'),
       planBytes('{"tags":['),
+      planBytes('{"profile":{"username":'),
     ]
     this.stamp = new Array<u8>(32)
     this.trueBytes = planBytes("t")
@@ -408,8 +446,10 @@ export class ReadPlan {
     this.failed = false
     this.articleRun = -1
     this.commentRun = -1
+    this.profileRun = -1
     this.articleEnded = false
     this.commentEnded = false
+    this.profileEnded = false
     this.commentsN = 0
     this.gen = this.gen === 2147483647 ? 1 : this.gen + 1
     this.tagN = 0
@@ -451,7 +491,7 @@ export class ReadPlan {
         this.countOf[i] = this.keyOf(i, false)
       }
     } else {
-      // An article or comments: one key a slug, the request that stands for it.
+      // An article, comments or a profile: one key a slug or a username, the request that stands for it.
       this.pageOf[i] = this.keyOf(i, true)
     }
     return true
@@ -619,7 +659,38 @@ export class ReadPlan {
       this.stmts[this.stmtCount] = K_COMMENTS
       this.stmtCount += 1
     }
+    if (this.kindPageN[K_PROFILE] > 0) {
+      this.profileRun = this.takeSlugs(conn, this.profiles, K_PROFILE)
+      if (this.profileRun < 0) {
+        return false
+      }
+      this.stmts[this.stmtCount] = K_PROFILE
+      this.stmtCount += 1
+    }
     return true
+  }
+
+  /** The batcher of `kind`: articles, comments or profiles. */
+  private batcher(kind: i32): PgBatcher {
+    return kind === K_ARTICLE ? this.articles : kind === K_COMMENTS ? this.comments : this.profiles
+  }
+
+  private runOf(kind: i32): i32 {
+    return kind === K_ARTICLE ? this.articleRun : kind === K_COMMENTS ? this.commentRun : this.profileRun
+  }
+
+  private endedOf(kind: i32): boolean {
+    return kind === K_ARTICLE ? this.articleEnded : kind === K_COMMENTS ? this.commentEnded : this.profileEnded
+  }
+
+  private setEnded(kind: i32): void {
+    if (kind === K_ARTICLE) {
+      this.articleEnded = true
+    } else if (kind === K_COMMENTS) {
+      this.commentEnded = true
+    } else {
+      this.profileEnded = true
+    }
   }
 
   /** Queues each distinct slug of `kind` in `b`, tagged with its key, and binds them all as one execution. */
@@ -639,8 +710,10 @@ export class ReadPlan {
     if (run < 0 || b.waiting() > 0) {
       if (kind === K_ARTICLE) {
         this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
-      } else {
+      } else if (kind === K_COMMENTS) {
         this.comments = new PgBatcher(planCommentBatch(PLAN_MAX))
+      } else {
+        this.profiles = new PgBatcher(planProfileBatch(PLAN_MAX))
       }
       return -1
     }
@@ -660,18 +733,17 @@ export class ReadPlan {
     if (this.commentRun >= 0 && !this.commentEnded) {
       this.slugFinish(K_COMMENTS)
     }
+    if (this.profileRun >= 0 && !this.profileEnded) {
+      this.slugFinish(K_PROFILE)
+    }
   }
 
   private slugFinish(kind: i32): void {
-    const b: PgBatcher = kind === K_ARTICLE ? this.articles : this.comments
-    const run: i32 = kind === K_ARTICLE ? this.articleRun : this.commentRun
+    const b: PgBatcher = this.batcher(kind)
+    const run: i32 = this.runOf(kind)
     b.fail(run)
     while (b.next(run) !== PG_BATCH_NONE) {}
-    if (kind === K_ARTICLE) {
-      this.articleEnded = true
-    } else {
-      this.commentEnded = true
-    }
+    this.setEnded(kind)
   }
 
   /** Binds `kind`'s list statement: its count keys, then its page keys. */
@@ -737,7 +809,7 @@ export class ReadPlan {
       return
     }
     const s: i32 = this.stmts[this.stmtDone]
-    if (s === K_ARTICLE || s === K_COMMENTS) {
+    if (s === K_ARTICLE || s === K_COMMENTS || s === K_PROFILE) {
       this.slugEvent(conn, event, s)
     } else if (s === K_TAGS) {
       if (event === PG_ROW) {
@@ -895,11 +967,11 @@ export class ReadPlan {
     return n
   }
 
-  /** One event of a batched slug read, articles or comments: each row and end goes to its key. */
+  /** One event of a batched read by slug or username, articles, comments or profiles: each row and end goes to its key. */
   private slugEvent(conn: PgConnection, event: i32, kind: i32): void {
-    const b: PgBatcher = kind === K_ARTICLE ? this.articles : this.comments
-    const run: i32 = kind === K_ARTICLE ? this.articleRun : this.commentRun
-    if ((kind === K_ARTICLE ? this.articleEnded : this.commentEnded) || run < 0) {
+    const b: PgBatcher = this.batcher(kind)
+    const run: i32 = this.runOf(kind)
+    if (this.endedOf(kind) || run < 0) {
       return
     }
     if (event === PG_ROW) {
@@ -910,11 +982,7 @@ export class ReadPlan {
       } else {
         b.fail(run)
       }
-      if (kind === K_ARTICLE) {
-        this.articleEnded = true
-      } else {
-        this.commentEnded = true
-      }
+      this.setEnded(kind)
     } else {
       return
     }
@@ -926,6 +994,8 @@ export class ReadPlan {
           this.slugId[key] = conn.int(0)
           this.slugAuthor[key] = conn.int(1)
           this.slugFound[key] = true
+        } else if (kind === K_PROFILE) {
+          this.profileRow(conn, key)
         } else {
           this.commentRow(conn, key)
         }
@@ -983,6 +1053,35 @@ export class ReadPlan {
     this.cAuthor[c] = conn.int(C_AUTHOR)
     this.commentsN = c + 1
     this.commentCount[key] += 1
+  }
+
+  /** A profile row of username key `key`: the user's id, and its answer written up to `following`. */
+  private profileRow(conn: PgConnection, key: i32): void {
+    if (conn.isNull(P_USERNAME)) {
+      this.failed = true
+      return
+    }
+    let worst: i32 = 128
+    for (let col: i32 = P_USERNAME; col <= P_IMAGE; col++) {
+      worst += jsonOutWorst(conn.colLength(col) > 0 ? conn.colLength(col) : 0)
+    }
+    this.text = grownBytes(this.text, this.textEnd + worst, this.textEnd)
+    const out: u8[] = this.text
+    const b: u8[] = conn.inputBuffer()
+    const f: u8[][] = this.f
+    let o: i32 = this.textEnd
+    this.pStart[key] = o
+    o = jsonOutRaw(out, o, f[24])
+    o = jsonOutString(out, o, b, conn.colStart(P_USERNAME), conn.colLength(P_USERNAME))
+    o = jsonOutRaw(out, o, f[10])
+    o = this.stringOrNull(out, o, conn, b, P_BIO)
+    o = jsonOutRaw(out, o, f[11])
+    o = this.stringOrNull(out, o, conn, b, P_IMAGE)
+    o = jsonOutRaw(out, o, f[12])
+    this.pEnd[key] = o
+    this.textEnd = o
+    this.slugId[key] = conn.int(P_ID)
+    this.slugFound[key] = true
   }
 
   /**
@@ -1052,9 +1151,22 @@ export class ReadPlan {
 
   /** After group A: queues the articles of slug reads, and the flags every viewer needs; whether group B has anything to read. */
   planB(): boolean {
+    this.flagViewerN = 0
     for (let i: i32 = 0; i < this.count; i++) {
       const kind: i32 = this.kinds[i]
       const v: i64 = this.viewers[i]
+      if (v !== 0) {
+        // The viewer's place among the plan's distinct viewers, at most PLAN_MAX of them.
+        let vi: i32 = 0
+        while (vi < this.flagViewerN && this.flagViewers[vi] !== v) {
+          vi++
+        }
+        if (vi === this.flagViewerN) {
+          this.flagViewers[vi] = v
+          this.flagViewerN = vi + 1
+        }
+        this.curVi = vi
+      }
       if (kind === K_ARTICLE) {
         const key: i32 = this.pageOf[i]
         if (this.slugFound[key]) {
@@ -1063,6 +1175,11 @@ export class ReadPlan {
             this.ask(v, this.slugId[key], 0)
             this.ask(v, this.slugAuthor[key], 1)
           }
+        }
+      } else if (kind === K_PROFILE) {
+        const key: i32 = this.pageOf[i]
+        if (v !== 0 && this.slugFound[key]) {
+          this.ask(v, this.slugId[key], 1)
         }
       } else if (kind === K_COMMENTS) {
         const key: i32 = this.pageOf[i]
@@ -1113,17 +1230,55 @@ export class ReadPlan {
       this.stmtCount += 1
     }
     if (this.asks > 0) {
-      if (!conn.bindStart("plan_flags")) {
+      // The asks by viewer and kind, a counting sort: Postgres then takes
+      // each viewer's ids as one array instead of regrouping every pair.
+      const buckets: i32 = 2 * this.flagViewerN
+      for (let b: i32 = 0; b <= buckets; b++) {
+        this.askStart[b] = 0
+      }
+      for (let k: i32 = 0; k < this.asks; k++) {
+        this.askStart[2 * this.askVi[k] + this.askKind[k] + 1] += 1
+      }
+      for (let b: i32 = 0; b < buckets; b++) {
+        this.askStart[b + 1] += this.askStart[b]
+      }
+      this.askOrder = grownI32(this.askOrder, this.asks, 0)
+      for (let k: i32 = 0; k < this.asks; k++) {
+        const b: i32 = 2 * this.askVi[k] + this.askKind[k]
+        this.askOrder[this.askStart[b]] = k
+        this.askStart[b] += 1
+      }
+      // Each bucket's start moved to its end: walk back one bucket.
+      for (let b: i32 = buckets; b > 0; b--) {
+        this.askStart[b] = this.askStart[b - 1]
+      }
+      this.askStart[0] = 0
+      if (!conn.bindStart("plan_flags") || !conn.paramIntArray(this.flagViewers, 0, this.flagViewerN)) {
         return false
       }
-      for (let part: i32 = 0; part < 4; part++) {
-        // Favorited viewers, their articles; following viewers, their authors.
+      for (let kind: i32 = 0; kind < 2; kind++) {
+        // Favorited: each viewer's articles; following: each viewer's authors.
         if (!conn.arrayStart()) {
           return false
         }
-        const kind: i32 = part < 2 ? 0 : 1
-        for (let k: i32 = 0; k < this.asks; k++) {
-          if (this.askKind[k] === kind && !conn.arrayInt(part % 2 === 0 ? this.askV[k] : this.askId[k])) {
+        for (let vi: i32 = 0; vi < this.flagViewerN; vi++) {
+          const b: i32 = 2 * vi + kind
+          const n: i32 = this.askStart[b + 1] - this.askStart[b]
+          this.flagText = grownBytes(this.flagText, 21 * n + 2, 0)
+          const t: u8[] = this.flagText
+          let o: i32 = 0
+          t[o] = toU8(123)
+          o++
+          for (let j: i32 = this.askStart[b]; j < this.askStart[b + 1]; j++) {
+            if (j > this.askStart[b]) {
+              t[o] = toU8(44)
+              o++
+            }
+            o = jwtDigits(this.askId[this.askOrder[j]], t, o)
+          }
+          t[o] = toU8(125)
+          o++
+          if (!conn.arrayElement(t, 0, o)) {
             conn.arrayEnd()
             return false
           }
@@ -1348,6 +1503,8 @@ export class ReadPlan {
     this.askId = grownInts(this.askId, k + 1, k)
     this.askKind = grownI32(this.askKind, k + 1, k)
     this.askSlot = grownI32(this.askSlot, k + 1, k)
+    this.askVi = grownI32(this.askVi, k + 1, k)
+    this.askVi[k] = this.curVi
     this.askSlot[k] = slot
     this.askV[k] = v
     this.askId[k] = id
@@ -1383,6 +1540,18 @@ export class ReadPlan {
       this.outRoom(this.tagsJsonEnd)
       copyBytes(this.out, 0, this.tagsJson, 0, this.tagsJsonEnd)
       this.outEnd = this.tagsJsonEnd
+      return 200
+    }
+    if (kind === K_PROFILE) {
+      if (!this.slugFound[key]) {
+        return 404
+      }
+      const n: i32 = this.pEnd[key] - this.pStart[key]
+      this.outRoom(n + 16)
+      copyBytes(this.out, 0, this.text, this.pStart[key], n)
+      let o: i32 = jsonOutBool(this.out, n, this.flag(v, this.slugId[key], 1))
+      o = jsonOutRaw(this.out, o, this.f[13])
+      this.outEnd = o
       return 200
     }
     if (kind === K_COMMENTS) {

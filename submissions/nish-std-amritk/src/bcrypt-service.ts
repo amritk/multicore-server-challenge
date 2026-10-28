@@ -482,8 +482,17 @@ export class BcryptClient {
   replyStatus: i32 = 0
   replyHash: u8[]
   replyHashLength: i32 = 0
+  /** The service's address; when a connect last failed (0 while none has) and when to try again. */
+  address: u8[]
+  failedAt: i64 = 0
+  retryAt: i64 = 0
+  /** Jobs sent and not yet answered. */
+  inFlight: i32 = 0
+  /** Unreachable past the worker's patience: given no jobs while another service is up. */
+  down: boolean = false
 
   constructor() {
+    this.address = new Array<u8>(18)
     this.output = new Array<u8>(BCRYPT_OUT)
     this.input = new Array<u8>(BCRYPT_IN)
     this.replyHash = new Array<u8>(BCRYPT_MAX_HASH)
@@ -589,6 +598,7 @@ export class BcryptClient {
     wipe(this.output)
     this.fd = -1
     this.connected = false
+    this.inFlight = 0
     this.outputStart = 0
     this.outputEnd = 0
     this.inputStart = 0
