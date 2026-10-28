@@ -549,9 +549,12 @@ const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
   config.applicationName = "conduit-nish"
   // Session settings at startup, for every connection: generic plans for
   // the prepared statements, no JIT and no parallel workers (one request
-  // is small), and the ISO and UTC spelling the connection reads.
+  // is small), no Memoize (a generic plan put one on the comment authors'
+  // lookup, whose cache is emptied every execution: 2 hits in 351, and the
+  // comments statement 7-12% slower with it), and the ISO and UTC spelling
+  // the connection reads.
   config.options =
-    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c DateStyle=ISO -c TimeZone=UTC"
+    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c DateStyle=ISO -c TimeZone=UTC"
   config.maxInFlight = maxInFlight
   config.inputSize = 65536
   config.maxOutput = PG_MAX_OUTPUT
