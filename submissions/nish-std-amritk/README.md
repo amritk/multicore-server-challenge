@@ -126,8 +126,13 @@ the compiler and its platform package.
   each write is sent again alone. A write whose connection is lost may have
   committed, so it answers 500 and is never sent again. A batch's favorites
   and unfavorites are one statement of each kind over their (viewer, slug)
-  pairs, and each then reads its article; a viewer with two toggles in one
-  batch keeps its own statements, so its toggles stay in order.
+  pairs; a viewer with two toggles in one batch keeps its own statements, so
+  its toggles stay in order. Once the batch has committed, each toggle's
+  article is read by the next read plan, like an article page, rather than
+  alone on the write connection: at 140,000 users on the VM that cut p95 by
+  about a fifth (183–204 ms against 234–274 ms) at the same CPU per request,
+  since the one write connection a worker has no longer waits on full
+  article reads between its batches.
 - **SQL.** A read plan's statements answer what SPEC.md's reference SQL
   answers, request by request (`src/sql.ts`): a page is the same ids in the
   same order, a count the same capped count (the global one walks the
