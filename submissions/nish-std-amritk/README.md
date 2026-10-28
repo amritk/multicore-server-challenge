@@ -7,9 +7,9 @@ on the same compiler and library and the same design. Since that build: the
 profiles go through the read plans too, the favorites are folded into them,
 logins go to bcrypt services in their own processes, every connection sets
 `enable_memoize=off`, the viewers' flags are sent as one id array per viewer,
-and half the CPUs serve HTTP (four on the box, where #83 ran two). On a VM
-like the box, #83's build held 90,000 users and this one 120,000 (below; not
-official).
+half the CPUs serve HTTP (four on the box, where #83 ran two), and the
+idle-connection sweep runs once a second. On a VM like the box, #83's build
+held 90,000 users and this one 140,000 (below; not official).
 
 Nish 0.23.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
@@ -46,6 +46,15 @@ the compiler and its platform package.
   lent to a connection while it reads and taken back while it is idle, so an
   idle keep-alive connection costs about 1.1 KiB of server memory. A busy
   PostgreSQL socket is re-armed in epoll only when its interest changes.
+- **Idle sweep once a second.** The server's sweep of idle connections
+  (`expire`) runs at most once a second rather than every turn of the loop.
+  In Nish 0.23.0 its own gate counts a head clock that has not started from a
+  connection's last move, so while any keep-alive has been quiet past the
+  30 s head timeout, which a few hundred of a worker's always are, every call
+  walked every connection: at 120,000 users `perf` put that loop at about
+  13% of the box, a third of the server's CPU. The library fix is
+  [amritk/nish#978](https://github.com/amritk/nish/pull/978). A timeout now
+  fires up to a second late, against timeouts of 30 s and 75 s.
 - **PostgreSQL.** Per worker, three read connections and one write
   connection. Every statement is prepared once per connection, with
   `plan_cache_mode=force_generic_plan`, `jit=off`,
@@ -274,14 +283,18 @@ and Postgres 47%), so the VM reads about 1% low.
 | `3de991e` (#83) | its defaults | 90,000 | 23,031 | 394 ms | 702 ms | 33% / 47% / 81% |
 | `40b375e` | `HTTP_WORKERS=2` | 100,000 | 25,241 | 449 ms | 553 ms | 34% / 48% / 83% |
 | `40b375e` | `HTTP_WORKERS=3` | 110,000 | 28,224 | 250 ms | 313 ms | 39% / 57% / 96% |
-| `40b375e` | `HTTP_WORKERS=4`, two searches | 120,000 | 30,115–30,483 | 322–419 ms | 421–513 ms | 39% / 58% / 98% |
+| `40b375e` | `HTTP_WORKERS=4`, three searches | 110,000–120,000 | 28,401–30,483 | 184–419 ms | 232–513 ms | 39% / 58% / 97–98% |
 | `40b375e` | `HTTP_WORKERS=5` | 120,000 | 30,055 | 446 ms | 612 ms | 38% / 59% / 98% |
+| this build | its defaults (four workers, sweep once a second), two searches | 140,000 | 35,407–36,107 | 240–406 ms | 333–603 ms | 28% / 67% / 97% |
 
 With four workers 130,000 failed its probe (p95 730 ms), with throughput flat
 at about 30,500 req/s. Two workers left the box about a sixth idle; four use
 all of it. Five held as many users with longer tails. During a hold the core
 that takes the network interrupts is the first to run out (about 30% of it in
-softirq).
+softirq). With the idle sweep once a second, the server's share of the box
+fell from 39% to 28%, which Postgres took: 140,000 held at the top of the
+searches' range, and 145,000 passed a probe (p95 483 ms) but not a 5-minute
+hold (p95 634 ms).
 
 ## Credits
 
