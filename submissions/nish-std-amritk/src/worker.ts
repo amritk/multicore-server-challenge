@@ -599,8 +599,6 @@ export class ConduitWorker {
   bcrypts: BcryptClient[]
   /** Requests answered, for a reader of `/proc`. */
   answered: i64 = 0
-  /** When the next sweep of idle connections is due (`monotonicNanos`). */
-  expireAt: i64 = 0
   /** Writes waiting for the next batch, a ring oldest first; and how many batches are in flight. */
   writeRing: i32[]
   writeHead: i32 = 0
@@ -777,15 +775,7 @@ export class ConduitWorker {
       for (let k: i32 = 0; k < n; k++) {
         this.ready(ready[2 * k], ready[2 * k + 1])
       }
-      // At most one sweep a second: `expire` would rescan every connection
-      // each turn while any keep-alive has been quiet past the head timeout
-      // (30 s), which a few hundred of a worker's always are. A deadline
-      // then fires up to a second late, against timeouts of 30 s and 75 s.
-      const now: i64 = monotonicNanos()
-      if (now >= this.expireAt) {
-        this.server.expire(now)
-        this.expireAt = now + toI64(1000000000)
-      }
+      this.server.expire(monotonicNanos())
       this.bcryptTick()
     }
   }

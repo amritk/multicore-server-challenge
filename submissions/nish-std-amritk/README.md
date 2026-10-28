@@ -7,11 +7,11 @@ on the same compiler and library and the same design. Since that build: the
 profiles go through the read plans too, the favorites are folded into them,
 logins go to bcrypt services in their own processes, every connection sets
 `enable_memoize=off`, the viewers' flags are sent as one id array per viewer,
-half the CPUs serve HTTP (four on the box, where #83 ran two), and the
-idle-connection sweep runs once a second. On a VM like the box, #83's build
+half the CPUs serve HTTP (four on the box, where #83 ran two), and Nish
+0.23.1 no longer sweeps every idle connection on every turn of the loop. On a VM like the box, #83's build
 held 90,000 users and this one 140,000 (below; not official).
 
-Nish 0.23.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.23.1 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -26,8 +26,9 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.23.0, the first published release with the
-`nish/net/postgres` array parameters built in the Bind (`arrayStart`,
+The server needs Nish 0.23.1, whose `nish/net/http1-server` no longer
+sweeps every connection on every turn of the loop (below). 0.23.0 was the
+first published release with the `nish/net/postgres` array parameters built in the Bind (`arrayStart`,
 `arrayElement`, `arrayInt`, `paramIntArray`) and the `PgBatcher` it uses
 (0.22.1 brought `PreforkConfig.restart`, `Http1Config.idleInput` and
 `TCP_NODELAY` on `tcpConnect`); `install.sh` installs it from npm. To try an
@@ -46,15 +47,15 @@ the compiler and its platform package.
   lent to a connection while it reads and taken back while it is idle, so an
   idle keep-alive connection costs about 1.1 KiB of server memory. A busy
   PostgreSQL socket is re-armed in epoll only when its interest changes.
-- **Idle sweep once a second.** The server's sweep of idle connections
-  (`expire`) runs at most once a second rather than every turn of the loop.
-  In Nish 0.23.0 its own gate counts a head clock that has not started from a
-  connection's last move, so while any keep-alive has been quiet past the
-  30 s head timeout, which a few hundred of a worker's always are, every call
-  walked every connection: at 120,000 users `perf` put that loop at about
-  13% of the box, a third of the server's CPU. The library fix is
-  [amritk/nish#978](https://github.com/amritk/nish/pull/978). A timeout now
-  fires up to a second late, against timeouts of 30 s and 75 s.
+- **Idle sweep.** In Nish 0.23.0, the gate of the server's sweep of idle
+  connections (`expire`) counted a head clock that had not started from a
+  connection's last move, so while any keep-alive had been quiet past the
+  30 s head timeout, which a few hundred of a worker's always are, every
+  turn of the loop walked every connection: at 120,000 users `perf` put that
+  loop at about 13% of the box, a third of the server's CPU. Sweeping once a
+  second took the VM from 120,000 users to 140,000; Nish 0.23.1 fixes the
+  gate itself ([amritk/nish#978](https://github.com/amritk/nish/pull/978)),
+  so the loop calls `expire` every turn again.
 - **PostgreSQL.** Per worker, three read connections and one write
   connection. Every statement is prepared once per connection, with
   `plan_cache_mode=force_generic_plan`, `jit=off`,
