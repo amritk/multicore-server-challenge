@@ -50,6 +50,7 @@ type searcher struct {
 	articles                                  int
 	idleCPU                                   float64
 	thinkScale                                float64
+	src                                       string
 	tzOffset                                  time.Duration
 	log                                       io.Writer
 	logf                                      *os.File
@@ -109,6 +110,7 @@ func cmdSearch(args []string) int {
 	fs.DurationVar(&s.idleMax, "idle-max", 90*time.Second, "longest wait for the target to go idle between phases (after a fixed 5 s)")
 	fs.BoolVar(&s.dry, "dry", false, "print the plan only")
 	fs.Float64Var(&s.thinkScale, "think-scale", 1.0, "TESTING ONLY: passed to every box")
+	fs.StringVar(&s.src, "src", "", "passed to every box as run -src (e.g. 'auto': dial from all of a box's public IPv4s)")
 	extra := fs.String("extra-ssh", "", "more boxes of the target as name=user@host,... (monitored and idle-checked like the target)")
 	fs.Parse(args)
 	for _, kv := range strings.Split(*extra, ",") {
@@ -512,9 +514,13 @@ func firstField(f []string, i int) string {
 }
 
 func (s *searcher) boxArgs(i, users, idOffset int, t0 time.Time, ramp, measure time.Duration, runID, out string) []string {
-	return []string{"-target", s.targetURL, "-users", strconv.Itoa(users), "-box-index", strconv.Itoa(i), "-id-offset", strconv.Itoa(idOffset),
+	args := []string{"-target", s.targetURL, "-users", strconv.Itoa(users), "-box-index", strconv.Itoa(i), "-id-offset", strconv.Itoa(idOffset),
 		"-ramp", ramp.String(), "-measure", measure.String(), "-tail", s.tail.String(), "-start-at", strconv.FormatInt(t0.UnixMilli(), 10),
 		"-run-id", runID, "-articles", strconv.Itoa(s.articles), "-think-scale", strconv.FormatFloat(s.thinkScale, 'g', -1, 64), "-out", out, "-q"}
+	if s.src != "" {
+		args = append(args, "-src", s.src)
+	}
+	return args
 }
 
 // waitIdle waits at least 5 s, then until the target's CPU is below -idle-cpu (max 90 s).

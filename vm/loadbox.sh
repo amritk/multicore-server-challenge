@@ -13,6 +13,8 @@
 #   bash vm/loadbox.sh summary                      every result so far, one line each
 #
 # MAX (default 240000) caps the probes; START (default 3000) is the warm-up and first probe.
+# SRC (default auto) is the loadgen's -src: the load box's IPv4s to dial from. Every user holds a connection, and one
+# source IP reaches one target IP:port on at most ~64k ports, so a box needs ceil(users / 64000) public IPv4s.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -65,7 +67,7 @@ run() {
   secret="$(ssh "root@$TARGET" cat /root/jwt-secret)"
   say "$label: search (results in $out)"
   "$LG" search -target-ssh "root@$TARGET" -target-url "http://$TARGET" -no-switch -lang nish \
-    -secret "$secret" -start "${START:-3000}" -max "${MAX:-240000}" -label "$label" -outdir "$out" 2>&1 | tee "$out/search.log"
+    -secret "$secret" -start "${START:-3000}" -max "${MAX:-240000}" -src "${SRC:-auto}" -label "$label" -outdir "$out" 2>&1 | tee "$out/search.log"
   ssh "root@$TARGET" "bash /opt/mcsc/vm/target.sh info" > "$out/target-info.txt" 2>&1 || true
   printf '%s  rev %s  %s\n' "$label" "$rev" "$*" > "$out/what.txt"
 }

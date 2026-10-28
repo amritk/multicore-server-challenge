@@ -29,14 +29,16 @@ var (
 )
 
 type httpTarget struct {
-	addrs []string // host:port to dial; VU g dials addrs[g mod len] (several IPs of one target: >64k users per load box)
-	host  string   // Host header (the first target's)
+	addrs []string       // host:port to dial; VU g dials addrs[g mod len] (several IPs of one target: >64k users per load box)
+	srcs  []*net.TCPAddr // local IPs to dial from (-src); VU g binds srcs[g/len(addrs) mod len]; none = the kernel picks
+	host  string         // Host header (the first target's)
 }
 
 type conn struct {
 	c      net.Conn
-	addr   string // host:port this user dials
-	reused bool   // has served at least one response
+	addr   string       // host:port this user dials
+	local  *net.TCPAddr // local IP this user dials from (nil = the kernel picks)
+	reused bool         // has served at least one response
 }
 
 func (c *conn) close() {
@@ -44,6 +46,14 @@ func (c *conn) close() {
 		c.c.Close()
 		c.c = nil
 	}
+}
+
+// bindNoPort sets IP_BIND_ADDRESS_NO_PORT (Linux) on a socket bound to a -src IP, so its port is chosen at
+// connect time, unique per destination, instead of at bind time from the whole range.
+func bindNoPort(_, _ string, rc syscall.RawConn) error {
+	const ipBindAddressNoPort = 24
+	rc.Control(func(fd uintptr) { syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBindAddressNoPort, 1) })
+	return nil
 }
 
 var dialer = net.Dialer{KeepAlive: -1} // browsers don't send TCP keep-alive probes on idle sockets this often; HTTP keep-alive is what matters
@@ -103,6 +113,9 @@ func (c *conn) roundTrip(t *httpTarget, dials *atomic.Int64, req []byte, deadlin
 		dials.Add(1)
 		d := dialer
 		d.Deadline = deadline
+		if c.local != nil {
+			d.LocalAddr, d.Control = c.local, bindNoPort
+		}
 		nc, err := d.Dial("tcp", c.addr)
 		if err != nil {
 			return 0, false, err

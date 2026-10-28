@@ -208,3 +208,16 @@ func TestStatLine(t *testing.T) {
 		t.Fatal(b, tot)
 	}
 }
+
+func TestParseSources(t *testing.T) {
+	if s, err := parseSources(""); s != nil || err != nil {
+		t.Fatalf("empty: %v %v", s, err)
+	}
+	s, err := parseSources("127.0.0.1, 127.0.0.2")
+	if err != nil || len(s) != 2 || s[1].IP.String() != "127.0.0.2" {
+		t.Fatalf("list: %v %v", s, err)
+	}
+	if _, err := parseSources("127.0.0.1,nope"); err == nil {
+		t.Fatal("bad IP accepted")
+	}
+}

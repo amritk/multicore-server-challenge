@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
+	"net"
 	"net/url"
 	"os"
 	"runtime"
@@ -34,6 +35,7 @@ func cmdRun(args []string) int {
 	articles := fs.Int("articles", seed.NArticles, "number of seeded articles (deep links pick ids 1..N); 10000 for the dev DB")
 	thinkScale := fs.Float64("think-scale", 1.0, "TESTING ONLY: multiply think times and session lengths")
 	quiet := fs.Bool("q", false, "don't print the summary table")
+	src := fs.String("src", "", "local IPs to dial from, comma-separated, or 'auto' (every global IPv4 of this box); each gives another ~64k source ports per target IP ('' = the kernel picks)")
 	fs.Parse(args)
 
 	if *secret == "" {
@@ -41,7 +43,7 @@ func cmdRun(args []string) int {
 		return 2
 	}
 	cfg := runConfig{target: *target, users: *users, box: *box, idOffset: *idOffset, ramp: *ramp, measure: *measure, tail: *tail,
-		secret: *secret, runID: *runID, articles: *articles, thinkScale: *thinkScale, t0: time.Now().Add(2 * time.Second)}
+		secret: *secret, src: *src, runID: *runID, articles: *articles, thinkScale: *thinkScale, t0: time.Now().Add(2 * time.Second)}
 	if *startAt > 0 {
 		cfg.t0 = time.UnixMilli(*startAt)
 	}
@@ -65,7 +67,7 @@ type runConfig struct {
 	target               string
 	users, box, idOffset int
 	ramp, measure, tail  time.Duration
-	secret, runID        string
+	secret, runID, src   string
 	articles             int
 	thinkScale           float64
 	t0                   time.Time
@@ -75,6 +77,9 @@ type runConfig struct {
 func runBox(c runConfig) (*BoxResult, error) {
 	t, err := parseTargets(c.target)
 	if err != nil {
+		return nil, err
+	}
+	if t.srcs, err = parseSources(c.src); err != nil {
 		return nil, err
 	}
 	if c.runID == "" {
@@ -291,4 +296,39 @@ func parseTargets(s string) (*httpTarget, error) {
 		t.addrs = append(t.addrs, addr)
 	}
 	return t, nil
+}
+
+// parseSources parses -src: comma-separated local IPs, or "auto" for every global unicast IPv4 of this box.
+func parseSources(s string) ([]*net.TCPAddr, error) {
+	var ips []net.IP
+	switch s {
+	case "":
+		return nil, nil
+	case "auto":
+		addrs, err := net.InterfaceAddrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && n.IP.IsGlobalUnicast() && !n.IP.IsPrivate() {
+				ips = append(ips, n.IP)
+			}
+		}
+	default:
+		for _, part := range strings.Split(s, ",") {
+			ip := net.ParseIP(strings.TrimSpace(part))
+			if ip == nil {
+				return nil, fmt.Errorf("-src: bad IP %q", part)
+			}
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("-src %q: no addresses", s)
+	}
+	srcs := make([]*net.TCPAddr, len(ips))
+	for i, ip := range ips {
+		srcs[i] = &net.TCPAddr{IP: ip}
+	}
+	return srcs, nil
 }

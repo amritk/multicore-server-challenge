@@ -90,7 +90,11 @@ type VU struct {
 func newVU(m *model, globalIdx int64, seedv uint64) *VU {
 	id := globalIdx%seed.NUsers + 1
 	v := &VU{m: m, r: rand.New(rand.NewPCG(seedv, uint64(globalIdx))), userID: id, pending: -1}
-	v.conn.addr = m.target.addrs[globalIdx%int64(len(m.target.addrs))]
+	n := int64(len(m.target.addrs))
+	v.conn.addr = m.target.addrs[globalIdx%n]
+	if len(m.target.srcs) > 0 {
+		v.conn.local = m.target.srcs[globalIdx/n%int64(len(m.target.srcs))]
+	}
 	return v
 }
 
