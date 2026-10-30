@@ -531,7 +531,7 @@ export class WorkerConfig {
    * window applies only while another plan is in flight.
    */
   planMin: i32 = 256
-  planWaitUs: i32 = 10000
+  planWaitUs: i32 = 30000
   /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
   planClock: i32 = 1
   planLight: i32 = 32
