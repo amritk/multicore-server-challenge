@@ -1149,6 +1149,17 @@ export class ReadPlan {
     return o + n
   }
 
+  /** `stampInto` for a binary row's `timestamptz` column: its microseconds, written as the text decoder would. */
+  private binaryStampInto(out: u8[], o: i32, conn: PgConnection, c: i32): i32 {
+    const n: i32 = conn.binary.timestamp(conn.inputBuffer(), conn.colStart(c), conn.colLength(c), this.stamp, 0)
+    if (n < 0) {
+      this.failed = true
+      return o
+    }
+    copyBytes(out, o, this.stamp, 0, n)
+    return o + n
+  }
+
   /** After group A: queues the articles of slug reads, and the flags every viewer needs; whether group B has anything to read. */
   planB(): boolean {
     this.flagViewerN = 0
@@ -1209,7 +1220,7 @@ export class ReadPlan {
     this.stmtDone = 0
     if (this.metas > 0) {
       if (
-        !conn.bindStart("plan_meta") ||
+        !conn.bindStartBinary("plan_meta") ||
         !conn.paramIntArray(this.metaIds, 0, this.metas) ||
         !conn.arrayStart()
       ) {
@@ -1337,7 +1348,7 @@ export class ReadPlan {
 
   /** An article row of `plan_meta`: its JSON, cut where the body and the two flags go. */
   private metaRow(conn: PgConnection): void {
-    const id: i64 = conn.int(M_ID)
+    const id: i64 = conn.binaryInt(M_ID)
     const slot: i32 = this.idSlot(id)
     if (this.idTable[slot] === 0) {
       this.failed = true
@@ -1400,13 +1411,13 @@ export class ReadPlan {
     }
     out[o] = toU8(93)
     o = jsonOutRaw(out, o + 1, f[5])
-    o = this.stampInto(out, o, conn, M_CREATED)
+    o = this.binaryStampInto(out, o, conn, M_CREATED)
     o = jsonOutRaw(out, o, f[6])
-    o = this.stampInto(out, o, conn, M_UPDATED)
+    o = this.binaryStampInto(out, o, conn, M_UPDATED)
     o = jsonOutRaw(out, o, f[7])
     this.m3[m] = o
     o = jsonOutRaw(out, o, f[8])
-    o = jwtDigits(conn.int(M_FAVORITES), out, o)
+    o = jwtDigits(conn.binaryInt(M_FAVORITES), out, o)
     o = jsonOutRaw(out, o, f[9])
     o = jsonOutString(out, o, b, conn.colStart(M_USERNAME), conn.colLength(M_USERNAME))
     o = jsonOutRaw(out, o, f[10])

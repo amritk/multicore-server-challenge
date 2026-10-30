@@ -22,10 +22,12 @@
 // that it reuses; nothing is allocated per request once the worker has
 // served its peak.
 import {
+  NET_TCP_QUICKACK,
   connectResult,
   netAddress,
   netClose,
   netRead,
+  netSetOption,
   netWrite,
   pollAdd,
   pollCreate,
@@ -539,6 +541,8 @@ export class WorkerConfig {
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
+  /** Whether each answered connection goes back to delayed ACKs (`ConduitWorker.ackDelay`). */
+  ackDelay: boolean = true
 }
 
 /** A pool's connection settings, with up to `maxInFlight` groups in flight on each connection. */
@@ -580,6 +584,10 @@ export class ConduitWorker {
   /** Per HTTP slot: its request in progress (-1 for none) and its generation. */
   slotReq: i32[]
   slotGen: i32[]
+  /** Per HTTP slot: an answer was written since its last flush (`ackDelayAfter`). */
+  slotAnswered: boolean[]
+  /** `WorkerConfig.ackDelay`, off for the process once the kernel refuses the option. */
+  ackDelay: boolean = true
   jsonNames: u8[][]
   jsonValues: u8[][]
   noNames: u8[][]
@@ -682,6 +690,8 @@ export class ConduitWorker {
     this.free = []
     this.slotReq = new Array<i32>(cfg.slots)
     this.slotGen = new Array<i32>(cfg.slots)
+    this.slotAnswered = new Array<boolean>(cfg.slots)
+    this.ackDelay = cfg.ackDelay
     for (let k: i32 = 0; k < cfg.slots; k++) {
       this.slotReq[k] = -1
     }
@@ -857,8 +867,36 @@ export class ConduitWorker {
     const wants: i32 = this.server.flush(slot)
     if ((wants & H1_DONE) !== 0) {
       this.closeSlot(slot)
-    } else if (this.server.rearm(slot, wants)) {
+      return
+    }
+    this.ackDelayAfter(slot)
+    if (this.server.rearm(slot, wants)) {
       pollModify(this.loop, this.server.fd(slot), wants & (H1_WANT_READ | H1_WANT_WRITE), slot)
+    }
+  }
+
+  /**
+   * After an answer on a kept-alive connection, its socket goes back to
+   * delayed ACKs, so the client's next request is acknowledged by its answer
+   * rather than by an ACK of its own. A client that paused longer than the
+   * retransmit timeout puts Linux in quick-ACK mode, which sends that empty
+   * ACK at once, before the request is even read; every one lands on the CPU
+   * that takes the network interrupts. Linux leaves delayed mode on its own,
+   * so it is set again after every answer. An idea from the challenge's
+   * zig-iouring-nick-potts submission (`ackdelay`).
+   */
+  ackDelayAfter(slot: i32): void {
+    if (slot < 0 || slot >= toI32(this.slotAnswered.length) || !this.slotAnswered[slot]) {
+      return
+    }
+    this.slotAnswered[slot] = false
+    if (!this.ackDelay) {
+      return
+    }
+    const rc: i32 = netSetOption(this.server.fd(slot), NET_TCP_QUICKACK, 0)
+    if (rc === -22 || rc === -95) {
+      console.log(`conduit: TCP_QUICKACK refused (${rc}); ACKs stay as the kernel sends them`)
+      this.ackDelay = false
     }
   }
 
@@ -930,6 +968,9 @@ export class ConduitWorker {
       conn.write(buf, 0, len)
     }
     conn.end()
+    if (slot < toI32(this.slotAnswered.length)) {
+      this.slotAnswered[slot] = true
+    }
     if (later) {
       this.drive(slot)
     }

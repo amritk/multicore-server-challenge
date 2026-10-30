@@ -18,7 +18,8 @@
 // per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160),
-// BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
+// BCRYPT_PORT (47391), IDLE_TIMEOUT_MS (75000) and ACK_DELAY (1; 0 leaves the
+// kernel's ACKs alone, worker.ts `ackDelayAfter`).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
@@ -106,6 +107,7 @@ export const main = (): i32 => {
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
+  cfg.ackDelay = (getenv("ACK_DELAY") ?? "1") !== "0"
   // Half the CPUs serve HTTP: on the challenge's 8 CPUs, 4 held 120,000 users
   // on a VM like it where 2 held 100,000 and 5 tied 4 with longer tails.
   const half: i32 = availableParallelism() / 2
