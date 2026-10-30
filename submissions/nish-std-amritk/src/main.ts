@@ -21,11 +21,14 @@
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
-// ACK_DELAY (1; 0 leaves the kernel's ACKs alone, worker.ts `ackDelayAfter`).
+// BCRYPT_WIDTH (0, timed at startup; 1 to 6 lanes a call),
+// ACK_DELAY (1; 0 leaves the kernel's ACKs alone, worker.ts `ackDelayAfter`),
+// GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything) and GZIP_MIN (1300).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
-import { runBcryptService } from "./bcrypt-service"
+import { bcryptCalibrate } from "nish/crypto/bcrypt"
+import { BCRYPT_LANES, runBcryptService } from "./bcrypt-service"
 import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
@@ -128,6 +131,9 @@ export const main = (): i32 => {
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
   cfg.ackDelay = (getenv("ACK_DELAY") ?? "1") !== "0"
+  const gzip: string = getenv("GZIP") ?? "0"
+  cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
+  cfg.gzipMin = envInt("GZIP_MIN", 1300)
   // Half the CPUs serve HTTP: on the challenge's 8 CPUs, 4 held 120,000 users
   // on a VM like it where 2 held 100,000 and 5 tied 4 with longer tails.
   const half: i32 = availableParallelism() / 2
@@ -136,6 +142,11 @@ export const main = (): i32 => {
   // while Postgres keeps every core busy: one process fell behind them.
   const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
   cfg.bcryptServices = services > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : services
+  // Timed here, before any process is busy, so every service runs the same width.
+  const asked: i32 = envInt("BCRYPT_WIDTH", 0)
+  const width: i32 = asked >= 1 && asked <= BCRYPT_LANES ? asked : bcryptCalibrate()
+  cfg.bcryptWidth = width
+  console.log(`conduit: bcrypt runs ${width} lanes a call`)
   const prefork = new PreforkConfig()
   prefork.workers = http + cfg.bcryptServices
   prefork.restart = false
@@ -151,7 +162,7 @@ export const main = (): i32 => {
       return 1
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20))
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {

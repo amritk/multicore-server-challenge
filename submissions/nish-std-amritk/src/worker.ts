@@ -53,6 +53,8 @@ import {
   Http1Server,
 } from "nish/net/http1-server"
 import { HTTP1_NO_BODY, Http1Parser } from "nish/net/http1"
+import { HTTP_CODING_IDENTITY, HttpCompressor } from "nish/net/http-compress"
+import { DEFLATE_FAST } from "nish/compress/deflate"
 import { JsonWriter } from "nish/json"
 import {
   JSON_TOK_ARRAY_BEGIN,
@@ -200,8 +202,6 @@ const TOKEN_BCRYPT: i32 = -2
 const TOKEN_POOL: i32 = -16
 /** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_POOL`. */
 export const BCRYPT_SERVICES_MAX: i32 = 14
-/** The jobs one bcrypt call takes (`bcryptHash4`, `bcryptVerify4`). */
-const BCRYPT_LANES: i32 = 4
 const POOL_TOKENS: i32 = 1024
 
 const AGAIN: i32 = -11
@@ -287,6 +287,8 @@ class ConduitReq {
   viewer: i64 = 0
   /** A status to answer once the body has ended, or 0. */
   status: i32 = 0
+  /** What the request's `Accept-Encoding` takes (`httpAcceptEncoding`). */
+  coding: i32 = 0
   text: u8[]
   textEnd: i32 = 0
   fStart: i32[]
@@ -538,11 +540,17 @@ export class WorkerConfig {
   bcryptPort: i32 = 47391
   /** How many bcrypt services listen, on `bcryptPort` and up. */
   bcryptServices: i32 = 1
+  /** The jobs one of their calls takes. */
+  bcryptWidth: i32 = 4
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
   /** Whether each answered connection goes back to delayed ACKs (`ConduitWorker.ackDelay`). */
   ackDelay: boolean = true
+  /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
+  gzip: i32 = 0
+  /** The shortest body gzip is tried on. */
+  gzipMin: i32 = 1300
 }
 
 /** A pool's connection settings, with up to `maxInFlight` groups in flight on each connection. */
@@ -586,6 +594,10 @@ export class ConduitWorker {
   slotGen: i32[]
   /** Per HTTP slot: an answer was written since its last flush (`ackDelayAfter`). */
   slotAnswered: boolean[]
+  /** `WorkerConfig.bcryptWidth`. */
+  bcryptWidth: i32 = 4
+  /** Gzips a JSON body when `WorkerConfig.gzip` asks; null otherwise. */
+  gzip: HttpCompressor | null = null
   /** `WorkerConfig.ackDelay`, off for the process once the kernel refuses the option. */
   ackDelay: boolean = true
   jsonNames: u8[][]
@@ -692,6 +704,12 @@ export class ConduitWorker {
     this.slotGen = new Array<i32>(cfg.slots)
     this.slotAnswered = new Array<boolean>(cfg.slots)
     this.ackDelay = cfg.ackDelay
+    this.bcryptWidth = cfg.bcryptWidth
+    if (cfg.gzip !== 0) {
+      const enc: HttpCompressor = new HttpCompressor(DEFLATE_FAST, cfg.gzipMin, RESPONSE_ROOM)
+      enc.segmentMode = cfg.gzip === 1
+      this.gzip = enc
+    }
     for (let k: i32 = 0; k < cfg.slots; k++) {
       this.slotReq[k] = -1
     }
@@ -955,6 +973,7 @@ export class ConduitWorker {
       slot < toI32(this.slotGen.length) &&
       this.server.holds(slot) &&
       this.slotGen[slot] === r.gen
+    const coding: i32 = r.coding
     this.release(r)
     if (!live) {
       return
@@ -963,17 +982,32 @@ export class ConduitWorker {
     const conn: Http1Connection = this.server.connection(slot)
     if (status === 204) {
       conn.respond(status, this.noNames, this.noNames, HTTP1_NO_BODY)
-    } else {
+      conn.end()
+    } else if (!this.answerGzipped(conn, status, buf, len, coding)) {
       conn.respond(status, this.jsonNames, this.jsonValues, len)
       conn.write(buf, 0, len)
+      conn.end()
     }
-    conn.end()
     if (slot < toI32(this.slotAnswered.length)) {
       this.slotAnswered[slot] = true
     }
     if (later) {
       this.drive(slot)
     }
+  }
+
+  /**
+   * Answers with `buf[0, len)` through `HttpCompressor`, which sends it gzipped
+   * only when that pays (`WorkerConfig.gzip`); false when it was left unanswered.
+   * Sending gzip only when it saves a TCP segment is an idea from the challenge's
+   * zig-iouring-nick-potts submission; the policy is Nish's own since 0.28.0.
+   */
+  answerGzipped(conn: Http1Connection, status: i32, buf: u8[], len: i32, coding: i32): boolean {
+    const enc: HttpCompressor | null = this.gzip
+    if (enc === null || len < enc.minLength) {
+      return false
+    }
+    return conn.respondEncoded(status, this.jsonNames, this.jsonValues, buf, 0, len, enc, coding) === 0
   }
 
   /** Answers `r` with what `w` wrote into `buf`, or 500 when it did not fit: a cut JSON text is never sent. */
@@ -1009,7 +1043,10 @@ export class ConduitWorker {
     if (slot >= 0 && slot < toI32(this.slotReq.length)) {
       this.slotReq[slot] = r.index
     }
-    const p: Http1Parser = this.server.connection(slot).parser
+    const conn: Http1Connection = this.server.connection(slot)
+    const p: Http1Parser = conn.parser
+    // Read now: a request waiting on Postgres leaves its head to the next one's rest.
+    r.coding = this.gzip !== null ? conn.acceptEncoding() : HTTP_CODING_IDENTITY
     this.route(r, p)
     if (r.status !== 0 || r.route === R_TAGS || r.route === R_SIGNUP || r.route === R_LOGIN) {
       return
@@ -2957,7 +2994,7 @@ export class ConduitWorker {
 
   /**
    * The bcrypt service the next job goes to: the one whose batch is the
-   * closest to full without being full, so a service's four lanes fill
+   * closest to full without being full, so a service's lanes fill
    * before the next is given work; and while every batch is full, the least
    * busy. Several services each get the box's fair share of a core when
    * Postgres keeps every core busy, where one alone fell behind the logins.
@@ -2975,7 +3012,7 @@ export class ConduitWorker {
       if (up && c.down) {
         continue
       }
-      const part: i32 = c.inFlight % BCRYPT_LANES
+      const part: i32 = c.inFlight % this.bcryptWidth
       if (part > bestPart) {
         bestPart = part
         best = k
