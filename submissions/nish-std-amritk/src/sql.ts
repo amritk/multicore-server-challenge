@@ -403,14 +403,14 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
   // The articles every list, feed and article page of the plan returned, each
   // once: ARTICLE_LIST_SELECT's columns but the viewer's two flags, with tag
   // ids for the tag names, and the body of those an article page shows. Its
-  // rows come in binary (`bindStartBinary`): the id, the count and the two
-  // times are sent as they are stored instead of formatted as text; the tag
-  // ids, an array, are cast to text, which a binary row carries as is.
+  // rows come in binary (`bindStartBinary`): the id, the count, the two times
+  // and the tag ids (an `int4[]`, read by `PgBinaryArray`) are sent as they
+  // are stored instead of formatted as text.
   ok =
     pool.register(
       "plan_meta",
       "SELECT a.id, a.slug, a.title, a.description, " +
-        "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)::text, " +
+        "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
         "a.created_at, a.updated_at, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), u.username, u.bio, u.image, " +
         "CASE WHEN q.with_body THEN a.body END " +
         "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id JOIN users u ON u.id = a.author_id",
@@ -463,6 +463,8 @@ const planBatch = (name: string, select: string, orderBy: string, maxRequests: i
   c.select = select
   c.orderBy = orderBy
   c.keyType = PG_BATCH_TEXT
+  // Binary rows: the ids and times are read as they are stored.
+  c.binary = true
   c.maxRequests = maxRequests
   // A plan's keys are at most PLAN_KEY_BYTES, each escaped at worst to twice its length.
   c.maxBytes = 65536

@@ -19,10 +19,11 @@
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
-// BCRYPT_PORT (47391), IDLE_TIMEOUT_MS (75000) and ACK_DELAY (1; 0 leaves the
-// kernel's ACKs alone, worker.ts `ackDelayAfter`).
+// BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
+// priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
+// ACK_DELAY (1; 0 leaves the kernel's ACKs alone, worker.ts `ackDelayAfter`).
 import { tcpListenFlags } from "nish:net"
-import { availableParallelism, getenv } from "nish:process"
+import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
 import { runBcryptService } from "./bcrypt-service"
 import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
@@ -84,6 +85,24 @@ const readDatabaseUrl = (url: string, cfg: WorkerConfig): boolean => {
   return cfg.dbUser.length > 0 && cfg.dbName.length > 0 && cfg.dbPort > 0
 }
 
+/**
+ * BCRYPT_NICE for a bcrypt service: a nice value from 1 to 19, or "idle" for
+ * SCHED_IDLE, so hashing yields the CPU to HTTP and Postgres; anything else
+ * leaves the priority alone. A refusal is logged and the service runs as is.
+ * Running bcrypt at idle priority is an idea from the challenge's
+ * zig-iouring-nick-potts submission.
+ */
+const lowerPriority = (nice: string): void => {
+  const n: i32 = nice === "idle" ? 0 : envInt("BCRYPT_NICE", 0)
+  if (nice !== "idle" && (n < 1 || n > 19)) {
+    return
+  }
+  const r: i32 = nice === "idle" ? setIdlePriority() : setNice(n)
+  if (r < 0) {
+    console.log(`conduit: the bcrypt service keeps its priority (BCRYPT_NICE=${nice}: ${r})`)
+  }
+}
+
 export const main = (): i32 => {
   const cfg = new WorkerConfig()
   if (!readDatabaseUrl(getenv("DATABASE_URL") ?? "", cfg)) {
@@ -131,6 +150,7 @@ export const main = (): i32 => {
       console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
     }
+    lowerPriority(getenv("BCRYPT_NICE") ?? "0")
     return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20))
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)

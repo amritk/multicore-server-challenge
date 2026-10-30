@@ -23,6 +23,8 @@
 // submission; the SQL and this code are written here.
 import { copyBytes } from "nish/bytes"
 import {
+  PG_ARRAY_ELEMENT,
+  PG_ARRAY_END,
   PG_BATCH_DONE,
   PG_BATCH_MISSING,
   PG_BATCH_NONE,
@@ -31,6 +33,8 @@ import {
   PG_ERROR,
   PG_ROW,
   PgBatcher,
+  PgBinary,
+  PgBinaryArray,
   PgConnection,
 } from "nish/net/postgres"
 import { jsonOutBool, jsonOutNull, jsonOutRaw, jsonOutString, jsonOutWorst } from "./json-out"
@@ -257,6 +261,8 @@ export class ReadPlan {
   stmtCount: i32 = 0
   stmtDone: i32 = 0
   failed: boolean = false
+  /** `tagRanks`'s walk over a row's tag ids, on a decoder of its own so a refused array leaves the connection's `binary.failed` alone. */
+  private readonly tagWalk: PgBinaryArray
   /** The batchers of articles and comments by slug, each distinct slug one key, `tag` its first request; and their runs. */
   articles: PgBatcher
   comments: PgBatcher
@@ -362,6 +368,7 @@ export class ReadPlan {
     this.flagText = new Array<u8>(4096)
     this.askTable = new Array<i32>(ID_TABLE)
     this.stmts = new Array<i32>(KINDS)
+    this.tagWalk = new PgBinaryArray(new PgBinary())
     this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
     this.comments = new PgBatcher(planCommentBatch(PLAN_MAX))
     this.profiles = new PgBatcher(planProfileBatch(PLAN_MAX))
@@ -991,8 +998,8 @@ export class ReadPlan {
       const key: i32 = b.tag
       if (e === PG_BATCH_ROW) {
         if (kind === K_ARTICLE) {
-          this.slugId[key] = conn.int(0)
-          this.slugAuthor[key] = conn.int(1)
+          this.slugId[key] = conn.binaryInt(0)
+          this.slugAuthor[key] = conn.binaryInt(1)
           this.slugFound[key] = true
         } else if (kind === K_PROFILE) {
           this.profileRow(conn, key)
@@ -1034,7 +1041,7 @@ export class ReadPlan {
     let o: i32 = this.textEnd
     this.c0[c] = o
     o = jsonOutRaw(out, o, f[19])
-    o = jwtDigits(conn.int(C_ID), out, o)
+    o = jwtDigits(conn.binaryInt(C_ID), out, o)
     o = jsonOutRaw(out, o, f[20])
     o = this.stampInto(out, o, conn, C_CREATED)
     o = jsonOutRaw(out, o, f[21])
@@ -1050,7 +1057,7 @@ export class ReadPlan {
     o = jsonOutRaw(out, o, f[12])
     this.c1[c] = o
     this.textEnd = o
-    this.cAuthor[c] = conn.int(C_AUTHOR)
+    this.cAuthor[c] = conn.binaryInt(C_AUTHOR)
     this.commentsN = c + 1
     this.commentCount[key] += 1
   }
@@ -1080,36 +1087,30 @@ export class ReadPlan {
     o = jsonOutRaw(out, o, f[12])
     this.pEnd[key] = o
     this.textEnd = o
-    this.slugId[key] = conn.int(P_ID)
+    this.slugId[key] = conn.binaryInt(P_ID)
     this.slugFound[key] = true
   }
 
   /**
-   * Reads the `plan_meta` row's tag ids to `ranks` as their ranks in name
-   * order, sorted; answers how many, or -1 when one is not a tag the plan
-   * read (or the column is not an integer array).
+   * Reads the `plan_meta` row's tag ids, a binary `int4[]`, to `ranks` as
+   * their ranks in name order, sorted; answers how many, or -1 when one is
+   * not a tag the plan read (or the column is not that array).
    */
   private tagRanks(conn: PgConnection): i32 {
     if (conn.isNull(M_TAGS)) {
       return 0
     }
-    const b: u8[] = conn.inputBuffer()
-    const start: i32 = conn.colStart(M_TAGS)
-    const end: i32 = start + conn.colLength(M_TAGS)
-    if (end - start < 2 || b[start] !== toU8(123) || b[end - 1] !== toU8(125)) {
-      return -1
-    }
+    const walk: PgBinaryArray = this.tagWalk
+    walk.begin(conn.inputBuffer(), conn.colStart(M_TAGS), conn.colLength(M_TAGS))
     let n: i32 = 0
-    let at: i32 = start + 1
-    while (at < end - 1) {
-      let v: i32 = 0
-      let digits: i32 = 0
-      while (at < end - 1 && b[at] >= toU8(48) && b[at] <= toU8(57) && digits < 9) {
-        v = v * 10 + (toI32(b[at]) - 48)
-        digits++
-        at++
+    let next: i32 = walk.next()
+    while (next === PG_ARRAY_ELEMENT) {
+      const id: i64 = walk.int()
+      if (id < 0 || id >= toI64(this.tagRank.length)) {
+        return -1
       }
-      if (digits === 0 || v >= toI32(this.tagRank.length) || this.tagStamp[v] !== this.gen) {
+      const v: i32 = toI32(id)
+      if (this.tagStamp[v] !== this.gen) {
         return -1
       }
       this.ranks = grownI32(this.ranks, n + 1, n)
@@ -1122,14 +1123,9 @@ export class ReadPlan {
       }
       this.ranks[k] = r
       n++
-      if (at < end - 1) {
-        if (b[at] !== toU8(44)) {
-          return -1
-        }
-        at++
-      }
+      next = walk.next()
     }
-    return n
+    return next === PG_ARRAY_END ? n : -1
   }
 
   private stringOrNull(out: u8[], o: i32, conn: PgConnection, b: u8[], c: i32): i32 {
@@ -1138,19 +1134,8 @@ export class ReadPlan {
       : jsonOutString(out, o, b, conn.colStart(c), conn.colLength(c))
   }
 
-  /** The `timestamptz` column `c` as RFC 3339 with milliseconds (no quotes), or `failed` when it does not read. */
+  /** A binary row's `timestamptz` column `c` as RFC 3339 with milliseconds (no quotes), or `failed` when it does not read. */
   private stampInto(out: u8[], o: i32, conn: PgConnection, c: i32): i32 {
-    const n: i32 = conn.text.timestamp(conn.inputBuffer(), conn.colStart(c), conn.colLength(c), this.stamp, 0)
-    if (n < 0) {
-      this.failed = true
-      return o
-    }
-    copyBytes(out, o, this.stamp, 0, n)
-    return o + n
-  }
-
-  /** `stampInto` for a binary row's `timestamptz` column: its microseconds, written as the text decoder would. */
-  private binaryStampInto(out: u8[], o: i32, conn: PgConnection, c: i32): i32 {
     const n: i32 = conn.binary.timestamp(conn.inputBuffer(), conn.colStart(c), conn.colLength(c), this.stamp, 0)
     if (n < 0) {
       this.failed = true
@@ -1411,9 +1396,9 @@ export class ReadPlan {
     }
     out[o] = toU8(93)
     o = jsonOutRaw(out, o + 1, f[5])
-    o = this.binaryStampInto(out, o, conn, M_CREATED)
+    o = this.stampInto(out, o, conn, M_CREATED)
     o = jsonOutRaw(out, o, f[6])
-    o = this.binaryStampInto(out, o, conn, M_UPDATED)
+    o = this.stampInto(out, o, conn, M_UPDATED)
     o = jsonOutRaw(out, o, f[7])
     this.m3[m] = o
     o = jsonOutRaw(out, o, f[8])
