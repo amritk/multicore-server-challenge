@@ -17,7 +17,8 @@
 // for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
 // per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160),
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
+// and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), IDLE_TIMEOUT_MS (75000) and ACK_DELAY (1; 0 leaves the
 // kernel's ACKs alone, worker.ts `ackDelayAfter`).
 import { tcpListenFlags } from "nish:net"
@@ -130,7 +131,7 @@ export const main = (): i32 => {
       console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
     }
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160))
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20))
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {

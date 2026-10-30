@@ -13,7 +13,10 @@
 //            hash length (u8) · the hash (a new one, for op 1)
 //
 // A batch runs once four jobs of one kind wait, or once the oldest has waited
-// `windowMs` (BCRYPT_BATCH_MS, the collection window). Every password is
+// its kind's collection window: `windowMs` for the logins' verifications
+// (BCRYPT_BATCH_MS), `hashWindowMs` for the sign-ups' new hashes
+// (BCRYPT_HASH_MS). Sign-ups are rare, so a long window seldom fills a batch
+// and only delays the one that waits. Every password is
 // copied into a fresh array the batch wraps as a `Secret`, and that array
 // and the frame it came in are wiped once the batch has run. Every login
 // verifies against its stored hash, and every hash is cost 10 with a salt
@@ -354,7 +357,7 @@ const bcryptDue = (q: BcryptQueue, now: i64, windowNs: i64): i32 => {
 }
 
 /** Serves the workers on `listener` until the process is stopped. Answers only on a failure to poll. */
-export const runBcryptService = (listener: i32, windowMs: i32): i32 => {
+export const runBcryptService = (listener: i32, windowMs: i32, hashWindowMs: i32): i32 => {
   const loop: i32 = pollCreate()
   if (loop < 0 || pollAdd(loop, listener, 1, BCRYPT_LISTENER) < 0) {
     return 1
@@ -368,13 +371,14 @@ export const runBcryptService = (listener: i32, windowMs: i32): i32 => {
   const ready: i32[] = new Array<i32>(2 * BCRYPT_CLIENTS + 2)
   const address: u8[] = new Array<u8>(18)
   const windowNs: i64 = toI64(windowMs) * 1000000
+  const hashWindowNs: i64 = toI64(hashWindowMs) * 1000000
   while (true) {
     // Wait no longer than the oldest job's window has left.
     let wait: i32 = -1
     const now0: i64 = monotonicNanos()
     for (const q of [hashes, verifies]) {
       if (q.count > 0) {
-        const left: i64 = q.since[q.head] + windowNs - now0
+        const left: i64 = q.since[q.head] + (q === hashes ? hashWindowNs : windowNs) - now0
         const ms: i32 = left <= 0 ? 0 : toI32(left / 1000000) + 1
         if (wait < 0 || ms < wait) {
           wait = ms
@@ -442,10 +446,10 @@ export const runBcryptService = (listener: i32, windowMs: i32): i32 => {
       }
     }
     // Run every batch that is due, then send the replies.
-    let due: i32 = bcryptDue(hashes, monotonicNanos(), windowNs)
+    let due: i32 = bcryptDue(hashes, monotonicNanos(), hashWindowNs)
     while (due > 0) {
       bcryptRunHash(peers, hashes, due)
-      due = bcryptDue(hashes, monotonicNanos(), windowNs)
+      due = bcryptDue(hashes, monotonicNanos(), hashWindowNs)
     }
     due = bcryptDue(verifies, monotonicNanos(), windowNs)
     while (due > 0) {
