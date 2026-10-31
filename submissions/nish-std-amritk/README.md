@@ -427,6 +427,10 @@ from the idea, not the code:
   ([#132](https://github.com/arjaythedev/multicore-server-challenge/pull/132))
   and rust-epoll-WorriedArrow: the feed's shared followees, a floor for their
   pages and a proof of their count; the statement follows theCatWisel's.
+- From rust-epoll-WorriedArrow and zig-iouring-nick-potts: timing bcrypt's
+  lane widths at startup and keeping the fastest, here through Nish's
+  `bcryptCalibrate`; and from nick-potts, gzip only when it saves a TCP
+  segment (`GZIP=1`, off by default).
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),
