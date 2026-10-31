@@ -3,7 +3,7 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`) and
-100,000 in #116 (`6e69d72`), on the same design. Since #116: Nish 0.28.0 reads an article's tag ids and the
+100,000 in #116 (`6e69d72`), on the same design. Since #116: Nish 0.29.0 reads an article's tag ids and the
 plan's batches in binary, and runs bcrypt at the width the CPU likes best; each answer turns delayed ACKs back on for its
 connection; and a sign-up's hash waits 20 ms for company instead of 160
 (below).
@@ -16,7 +16,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.28.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.29.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -31,7 +31,7 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.28.0: 0.26.0 brought binary result columns to
+The server needs Nish 0.29.0: 0.26.0 brought binary result columns to
 `nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
 `TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
 (`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and
