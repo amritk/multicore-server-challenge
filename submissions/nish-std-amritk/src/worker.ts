@@ -111,6 +111,7 @@ import {
   K_TAG,
   K_TAGS,
   PLAN_ALONE,
+  CountRun,
   ReadPlan,
 } from "./plan"
 import {
@@ -215,6 +216,8 @@ const WRITE_BATCH: i32 = 128
 const PLAN_FREE: i32 = 0
 const PLAN_A: i32 = 1
 const PLAN_B: i32 = 2
+/** The plan waits for its favorite counts, between group A and group B. */
+const PLAN_COUNT: i32 = 3
 /** The longest key (a tag, a username, a slug) a read plan takes; a longer one is read alone. */
 const PLAN_KEY_MAX: i32 = 1024
 /**
@@ -632,6 +635,10 @@ export class ConduitWorker {
   /** The read plans, each one's `PLAN_` state, and the reads waiting for the next, a ring oldest first. */
   plans: ReadPlan[]
   planState: i32[]
+  /** The count lane (plan.ts `CountRun`): the run plans join, the one running, and whether one runs or is asked for. */
+  countRuns: CountRun[]
+  countOpen: i32 = 0
+  countBusy: boolean = false
   planRing: i32[]
   planHead: i32 = 0
   planCount: i32 = 0
@@ -757,6 +764,7 @@ export class ConduitWorker {
     registerPlanStatements(this.pools[POOL_READ])
     this.plans = []
     this.planState = []
+    this.countRuns = [new CountRun(), new CountRun()]
     for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
       this.plans.push(new ReadPlan())
       this.planState.push(PLAN_FREE)
@@ -1742,18 +1750,66 @@ export class ConduitWorker {
         return
       }
       if (plan.planB()) {
-        const ticket: i32 = this.pools[POOL_READ].request()
-        if (ticket !== PG_POOL_FULL) {
-          const at: i32 = ticket % TICKET_RING
-          this.tickets[POOL_READ][at] = -1
-          this.ticketPlan[at] = p
-          this.planState[p] = PLAN_B
+        if (plan.metas > 0) {
+          if (this.countRuns[this.countOpen].join(p, plan)) {
+            this.planState[p] = PLAN_COUNT
+            return
+          }
+          plan.failed = true
+        } else if (this.planAskB(p)) {
           return
         }
-        plan.failed = true
       }
     }
     this.planFinish(p, false)
+  }
+
+  /** Asks the read pool for plan `p`'s group B; false, with the plan failed, when the pool is full. */
+  planAskB(p: i32): boolean {
+    const ticket: i32 = this.pools[POOL_READ].request()
+    if (ticket === PG_POOL_FULL) {
+      this.plans[p].failed = true
+      return false
+    }
+    const at: i32 = ticket % TICKET_RING
+    this.tickets[POOL_READ][at] = -1
+    this.ticketPlan[at] = p
+    this.planState[p] = PLAN_B
+    return true
+  }
+
+  /** Asks the read pool for the next count run, when plans wait for one and none is running. */
+  startCounts(): void {
+    if (this.countBusy || this.countRuns[this.countOpen].plans.length === 0) {
+      return
+    }
+    const ticket: i32 = this.pools[POOL_READ].request()
+    if (ticket === PG_POOL_FULL) {
+      return
+    }
+    const at: i32 = ticket % TICKET_RING
+    this.tickets[POOL_READ][at] = -1
+    this.ticketPlan[at] = toI32(this.plans.length)
+    this.countBusy = true
+  }
+
+  /** The running count run ended: each of its plans goes on to group B, or alone, or fails with the connection. */
+  countsDone(failed: boolean, lost: boolean): void {
+    const run: CountRun = this.countRuns[1 - this.countOpen]
+    this.countBusy = false
+    for (const p of run.plans) {
+      if (lost) {
+        this.planFinish(p, true)
+      } else {
+        const plan: ReadPlan = this.plans[p]
+        plan.failed = plan.failed || failed || run.failed
+        plan.takeCounts(run)
+        if (plan.failed || !this.planAskB(p)) {
+          this.planFinish(p, false)
+        }
+      }
+    }
+    run.reset()
   }
 
   /**
@@ -1787,6 +1843,10 @@ export class ConduitWorker {
   planEvent(ticket: i32, conn: PgConnection, event: i32): void {
     const at: i32 = ticket % TICKET_RING
     const p: i32 = this.ticketPlan[at]
+    if (p === toI32(this.plans.length)) {
+      this.countEvent(at, conn, event)
+      return
+    }
     const plan: ReadPlan = this.plans[p]
     if (event === PG_LOST) {
       this.ticketPlan[at] = -1
@@ -1805,6 +1865,19 @@ export class ConduitWorker {
     }
   }
 
+  /** One event of the running count run. */
+  countEvent(at: i32, conn: PgConnection, event: i32): void {
+    if (event === PG_LOST) {
+      this.ticketPlan[at] = -1
+      this.countsDone(true, true)
+    } else if (event === PG_GROUP_DONE) {
+      this.ticketPlan[at] = -1
+      this.countsDone(conn.groupFailed, false)
+    } else {
+      this.countRuns[1 - this.countOpen].event(conn, event)
+    }
+  }
+
   /** Marks `r` as waiting in one of the worker's rings for pool `p`, with no ticket yet. */
   wait(r: ConduitReq, p: i32): void {
     r.pool = p
@@ -1820,6 +1893,7 @@ export class ConduitWorker {
   pump(): void {
     this.batchWrites()
     this.startPlans()
+    this.startCounts()
     for (let p: i32 = 0; p < 2; p++) {
       const pool: PgPool = this.pools[p]
       let s: i32 = pool.dispatch()
@@ -1829,6 +1903,22 @@ export class ConduitWorker {
         if (p === POOL_READ && this.ticketPlan[at] >= 0) {
           // A read plan's group: its statements over the plan's keys.
           const pi: i32 = this.ticketPlan[at]
+          if (pi === toI32(this.plans.length)) {
+            // The count run: it takes every plan waiting now, and the next plans open the other.
+            const run: CountRun = this.countRuns[this.countOpen]
+            this.countOpen = 1 - this.countOpen
+            const counted: boolean = run.bind(conn)
+            if (!counted) {
+              conn.bindCancel()
+            }
+            run.failed = !counted
+            if (!pool.send()) {
+              this.ticketPlan[at] = -1
+              this.countsDone(true, false)
+            }
+            s = pool.dispatch()
+            continue
+          }
           const plan: ReadPlan = this.plans[pi]
           const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn) : plan.bindB(conn)
           if (!bound) {

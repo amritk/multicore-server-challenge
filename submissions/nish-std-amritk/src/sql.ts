@@ -425,9 +425,18 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
       "plan_meta",
       "SELECT a.id, a.slug, a.title, a.description, " +
         "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
-        "a.created_at, a.updated_at, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), u.username, u.bio, u.image, " +
+        "a.created_at, a.updated_at, u.username, u.bio, u.image, " +
         "CASE WHEN q.with_body THEN a.body END " +
         "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id JOIN users u ON u.id = a.author_id",
+      none
+    ) && ok
+  // Each article's favorite count, for a worker's count lane (plan.ts
+  // `CountRun`): the costliest column of `plan_meta`, a walk of the article's
+  // index entries and, for the pages writes have touched, its heap.
+  ok =
+    pool.register(
+      "plan_counts",
+      "SELECT q.id, (SELECT count(*) FROM favorites f WHERE f.article_id = q.id) FROM unnest($1::int8[]) q(id)",
       none
     ) && ok
   // The flags: (0, viewer, article) for each favorite asked about that

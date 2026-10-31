@@ -94,11 +94,10 @@ const M_DESCRIPTION: i32 = 3
 const M_TAGS: i32 = 4
 const M_CREATED: i32 = 5
 const M_UPDATED: i32 = 6
-const M_FAVORITES: i32 = 7
-const M_USERNAME: i32 = 8
-const M_BIO: i32 = 9
-const M_IMAGE: i32 = 10
-const M_BODY: i32 = 11
+const M_USERNAME: i32 = 7
+const M_BIO: i32 = 8
+const M_IMAGE: i32 = 9
+const M_BODY: i32 = 10
 
 /** A comment's columns in a `plan_comments` row: the article's id first, NULL comment columns when it has none. */
 const C_ID: i32 = 1
@@ -172,6 +171,105 @@ const fnv = (): u32 => {
 const slotOf = (h: u32): i32 => toI32(h >> 1)
 
 /** One read plan's requests, keys, rows and answers; reused plan after plan. */
+/** The most distinct articles one count run takes; a plan past it goes alone. */
+const COUNT_MAX: i32 = 65536
+/** Twice `COUNT_MAX`, a power of two: the open-addressed table of a run's articles. */
+const COUNT_TABLE: i32 = 131072
+
+/**
+ * One statement of a worker's count lane: the union of the articles of every
+ * plan waiting when it starts, each counted once.
+ *
+ * Favorite counts are the one column of a plan that costs by the row walked
+ * rather than by the article, and a popular article is on the pages of plan
+ * after plan: on the VM at 145,000 users, 54% of the index entries a plan
+ * counted had been counted for the same article in the 30 ms before. So they
+ * leave `plan_meta` for a lane of their own. A worker runs one `plan_counts`
+ * at a time, and the plans that finish group A meanwhile wait for the next,
+ * which takes them all, however many; the plans themselves stay concurrent.
+ * A run is fixed only as it is bound, so every count is read after the
+ * requests it answers arrived, and a run keeps nothing once its plans have
+ * their counts.
+ */
+export class CountRun {
+  /** The plans waiting for this run, by their place in the worker's plans. */
+  plans: i32[]
+  ids: i64[]
+  counts: i64[]
+  private readonly table: i32[]
+  private readonly slots: i32[]
+  n: i32 = 0
+  /** Its statement could not be bound: its plans go alone. */
+  failed: boolean = false
+
+  constructor() {
+    this.plans = []
+    this.ids = new Array<i64>(COUNT_MAX)
+    this.counts = new Array<i64>(COUNT_MAX)
+    this.slots = new Array<i32>(COUNT_MAX)
+    this.table = new Array<i32>(COUNT_TABLE)
+  }
+
+  private slot(id: i64): i32 {
+    const mask: i32 = COUNT_TABLE - 1
+    let at: i32 = slotOf(hashInt(fnv(), id)) & mask
+    while (this.table[at] > 0 && this.ids[this.table[at] - 1] !== id) {
+      at = (at + 1) & mask
+    }
+    return at
+  }
+
+  /** Takes plan `p`'s articles; false, with none taken for good, when the run has no room for them. */
+  join(p: i32, plan: ReadPlan): boolean {
+    if (this.n + plan.metas > COUNT_MAX) {
+      return false
+    }
+    for (let k: i32 = 0; k < plan.metas; k++) {
+      const id: i64 = plan.metaIds[k]
+      const at: i32 = this.slot(id)
+      if (this.table[at] === 0) {
+        this.ids[this.n] = id
+        this.counts[this.n] = toI64(0)
+        this.slots[this.n] = at
+        this.n += 1
+        this.table[at] = this.n
+      }
+    }
+    this.plans.push(p)
+    return true
+  }
+
+  /** `id`'s count, read by the run that held it. */
+  count(id: i64): i64 {
+    const at: i32 = this.table[this.slot(id)]
+    return at > 0 ? this.counts[at - 1] : toI64(0)
+  }
+
+  bind(conn: PgConnection): boolean {
+    return conn.bindStartBinary("plan_counts") && conn.paramIntArray(this.ids, 0, this.n) && conn.bindEnd()
+  }
+
+  /** A row of `plan_counts`: (id, count). */
+  event(conn: PgConnection, event: i32): void {
+    if (event === PG_ROW) {
+      const at: i32 = this.table[this.slot(conn.binaryInt(0))]
+      if (at > 0) {
+        this.counts[at - 1] = conn.binaryInt(1)
+      }
+    }
+  }
+
+  /** Empties the run for the plans that come next. */
+  reset(): void {
+    for (let k: i32 = 0; k < this.n; k++) {
+      this.table[this.slots[k]] = 0
+    }
+    this.n = 0
+    this.failed = false
+    this.plans = []
+  }
+}
+
 export class ReadPlan {
   /** Each request: the caller's tag, its kind, viewer, limit, offset and key (a window of `keys`). */
   readonly tags: i32[]
@@ -216,6 +314,8 @@ export class ReadPlan {
   idEnd: i32 = 0
   /** The distinct articles group B reads, an open-addressed table of `metaIds` places plus one, and which need a body. */
   metaIds: i64[]
+  /** Each of `metaIds`' favorite count, from the worker's count lane. */
+  metaCount: i64[]
   metaSlot: i32[]
   metaFull: boolean[]
   metas: i32 = 0
@@ -342,6 +442,7 @@ export class ReadPlan {
     this.ids = new Array<i64>(4096)
     this.authors = new Array<i64>(4096)
     this.metaIds = new Array<i64>(4096)
+    this.metaCount = new Array<i64>(4096)
     this.metaSlot = new Array<i32>(4096)
     this.metaFull = new Array<boolean>(4096)
     this.idTable = new Array<i32>(ID_TABLE)
@@ -1197,6 +1298,13 @@ export class ReadPlan {
     return this.metas > 0 || this.asks > 0
   }
 
+  /** Takes the favorite count of every article of the plan from `run`. */
+  takeCounts(run: CountRun): void {
+    for (let k: i32 = 0; k < this.metas; k++) {
+      this.metaCount[k] = run.count(this.metaIds[k])
+    }
+  }
+
   // ---- Group B --------------------------------------------------------------------
 
   /** Binds group B: the articles, then the flags; false when a builder call refused. */
@@ -1402,7 +1510,7 @@ export class ReadPlan {
     o = jsonOutRaw(out, o, f[7])
     this.m3[m] = o
     o = jsonOutRaw(out, o, f[8])
-    o = jwtDigits(conn.binaryInt(M_FAVORITES), out, o)
+    o = jwtDigits(this.metaCount[m], out, o)
     o = jsonOutRaw(out, o, f[9])
     o = jsonOutString(out, o, b, conn.colStart(M_USERNAME), conn.colLength(M_USERNAME))
     o = jsonOutRaw(out, o, f[10])
@@ -1455,6 +1563,7 @@ export class ReadPlan {
     }
     const keep: i32 = this.metas
     this.metaIds = grownInts(this.metaIds, n, keep)
+    this.metaCount = grownInts(this.metaCount, n, keep)
     this.metaSlot = grownI32(this.metaSlot, n, keep)
     this.m0 = grownI32(this.m0, n, keep)
     this.m1 = grownI32(this.m1, n, keep)
