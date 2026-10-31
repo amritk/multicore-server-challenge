@@ -203,8 +203,8 @@ host tuning.
 
 Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
-`DB_READ_CONNS` (4) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
-(16), `DB_READ_PLANS` (`DB_READ_CONNS`) read plans in flight per worker,
+`DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
+(16), `DB_READ_PLANS` (10) read plans in flight per worker,
 `READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (512) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,

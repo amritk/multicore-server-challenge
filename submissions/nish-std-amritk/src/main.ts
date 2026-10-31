@@ -12,9 +12,9 @@
 // and the ports above it.
 //
 // Configured by the environment only: DATABASE_URL, JWT_SECRET, HOST, PORT
-// (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (4) and
+// (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (6) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
-// for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
+// for the read connections, DB_READ_PLANS (10) read plans in flight
 // per worker, READ_PLAN_MIN (512), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
@@ -118,11 +118,11 @@ export const main = (): i32 => {
   }
   cfg.host = getenv("HOST") ?? "0.0.0.0"
   cfg.port = envInt("PORT", 3000)
-  cfg.readConns = envInt("DB_READ_CONNS", 4)
+  cfg.readConns = envInt("DB_READ_CONNS", 6)
   cfg.writeConns = envInt("DB_WRITE_CONNS", 1)
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
-  cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
+  cfg.readPlans = envInt("DB_READ_PLANS", 10)
   cfg.planMin = envInt("READ_PLAN_MIN", 512)
   cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
