@@ -3,10 +3,14 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`) and
-100,000 in #116 (`6e69d72`), on the same design. Since #116: Nish 0.29.0 reads an article's tag ids and the
-plan's batches in binary, and runs bcrypt at the width the CPU likes best; each answer turns delayed ACKs back on for its
-connection; and a sign-up's hash waits 20 ms for company instead of 160
-(below).
+100,000 in #116 (`6e69d72`), on the same design. Since #116, most of it to
+cut what Postgres spends a request: favorite counts leave `plan_meta` for a
+count lane of their own, an idea of this submission's (below); two HTTP
+workers instead of four, for read plans twice the size; feeds share their
+followees within a plan; Nish 0.29.0 reads an article's tag ids and the
+plan's batches in binary, and runs bcrypt at the width the CPU likes best;
+each answer turns delayed ACKs back on for its connection; and a sign-up's
+hash waits 20 ms for company instead of 160.
 
 Since #83: the profiles go through the read plans too, the favorites are
 folded into them, logins go to bcrypt services in their own processes, every
@@ -139,6 +143,29 @@ and four on the box), and
   from 149 µs a request to 135, 129 and 128, and p95 from 43 ms to 57, 67
   and 74. At 145,000 users, past the knee, 30 ms saved nothing (206 µs a
   request against 208) and p95 was worse, so the window stays at 10 ms.
+- **The count lane.** A favorite count walks the article's index entries,
+  and the heap of any page writes have touched, so unlike the rest of an
+  article it costs by the row: taking the column out of `plan_meta`, to
+  measure it, took Postgres from 124 µs a request to 95 at 120,000 users on
+  the VM, and p99 from 199 ms to 57. Popular articles are on the pages of
+  plan after plan: at 145,000 users, 54% of the entries a plan counted had
+  been counted for the same article in the 30 ms before. So each worker runs
+  one `plan_counts` at a time, over the union of the articles of every plan
+  waiting when it starts, each counted once; the plans stay concurrent and
+  only the costly column queues. A run is fixed as it is bound, so every
+  count is read after the requests it answers arrived, and it keeps nothing
+  once its plans have their counts: this is a batch, not a cache.
+- **Two HTTP workers.** Each worker has its own read queue, so fewer workers
+  make bigger plans. At 120,000 users on the VM, Postgres spent 150 µs a
+  request with four, 129 with two and 117 with one, which ran out of core.
+  Each worker has six read connections and up to ten plans in flight; eight
+  connections in all left p95 at 400-600 ms at 155,000 users, and six or four
+  stop near 37,000 and 29,000 requests a second with CPU to spare.
+- **Feeds in a plan.** Followees several viewers of a plan share are looked
+  at once: one with 1,000 articles proves its followers' count without a
+  count, and the depth-th newest article of one is a floor that stops every
+  other followee's walk. The rows matched the old statement on 40 random
+  batches of the full seed, and total CPU fell by about 6 µs a request.
 - **Delayed ACKs.** A request's answer is often sent within the 40 ms the
   kernel waits to ACK it alone, but a socket with `TCP_NODELAY` drops back
   to quick ACKs. After each answer the worker sets `TCP_QUICKACK` off on
@@ -311,6 +338,25 @@ default.
 
 ### On a VM like the challenge's box (not official)
 
+Latest, the 5-minute holds on the same VM, one load box, builds alternated.
+"Steady" is the seconds from 90 s on, median of each second's p99:
+
+| Build | Users | Verdict | req/s | p95 | p99 | Steady p99 | µs a request (Postgres + server) |
+|---|--:|---|--:|--:|--:|--:|---|
+| before this update, two holds | 145,000 | PASS, PASS | 37,306-37,440 | 205-288 ms | 600-666 ms | 139-151 ms | 143 + 67-69 |
+| before this update, two holds | 155,000 | FAIL, FAIL | 37,765-37,952 | 560-692 ms | 1,436-2,542 ms | 372-386 ms | 140 + 69-70 |
+| this one, two holds | 155,000 | FAIL, FAIL | 38,986-39,442 | 190-291 ms | 2,587-4,420 ms | 118-135 ms | 119-120 + 63-64 |
+| this build on 0.28.0 (three) and 0.29.0 (two) | 165,000 | 2 PASS, 3 FAIL | 39,864-41,171 | 292-462 ms | 988-4,534 ms | 193-265 ms | 114-119 + 64-71 |
+| this one on 0.28.0 | 175,000 | FAIL | 40,760 | 515 ms | 1,161 ms | 344 ms | 116 + 68 |
+
+The failures above 145,000 on this build are p99, from a stall of 8 to 19
+seconds around the end of the ramp, which starts before the ramp ends, grows
+with the users, and comes with the load box's own sampler running up to 22 s
+late. It may be the rig more than the server: nothing here has separated
+them. Nish 0.29.0 alone measured the same as 0.28.0. Gzip
+(`GZIP=1`, `nish/net/http-compress`) cost about 30 µs a request and failed its
+holds at 145,000, and stays off.
+
 The challenge's own `loadgen search` (warm-up, doubling probes, bisection to
 5%, 5-minute holds; the official pass rule) against an 8-vCPU Intel Xeon
 Platinum 8260 VM with 16 GB running PostgreSQL 18 and the server, from a
@@ -377,6 +423,10 @@ from the idea, not the code:
   ([#79](https://github.com/arjaythedev/multicore-server-challenge/pull/79)):
   turning delayed ACKs back on after each answer (`TCP_QUICKACK` off), and
   bcrypt at idle priority (`BCRYPT_NICE=idle`, off by default here).
+- From [rust-epoll-theCatWisel](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-theCatWisel)
+  ([#132](https://github.com/arjaythedev/multicore-server-challenge/pull/132))
+  and rust-epoll-WorriedArrow: the feed's shared followees, a floor for their
+  pages and a proof of their count; the statement follows theCatWisel's.
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),
