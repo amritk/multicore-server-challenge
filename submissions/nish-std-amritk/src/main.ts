@@ -15,7 +15,7 @@
 // (the challenge's), and optionally HTTP_WORKERS (half the CPUs, at least 2), DB_READ_CONNS (3) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
-// per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (30000) and
+// per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
@@ -124,7 +124,7 @@ export const main = (): i32 => {
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
   cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
   cfg.planMin = envInt("READ_PLAN_MIN", 256)
-  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 30000)
+  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)
@@ -142,11 +142,12 @@ export const main = (): i32 => {
   // while Postgres keeps every core busy: one process fell behind them.
   const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
   cfg.bcryptServices = services > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : services
-  // Timed here, before any process is busy, so every service runs the same width.
+  // Every process comes through here, prefork starting each anew, so each times
+  // it for itself: all at once, at startup, about 30 ms. A worker's width only
+  // says which service it fills next.
   const asked: i32 = envInt("BCRYPT_WIDTH", 0)
   const width: i32 = asked >= 1 && asked <= BCRYPT_LANES ? asked : bcryptCalibrate()
   cfg.bcryptWidth = width
-  console.log(`conduit: bcrypt runs ${width} lanes a call`)
   const prefork = new PreforkConfig()
   prefork.workers = http + cfg.bcryptServices
   prefork.restart = false
@@ -160,6 +161,9 @@ export const main = (): i32 => {
     if (listener < 0) {
       console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
+    }
+    if (index === http) {
+      console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
     return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20), width)
