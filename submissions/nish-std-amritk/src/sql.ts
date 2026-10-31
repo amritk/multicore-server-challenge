@@ -384,17 +384,31 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
     ) && ok
   // A feed's page reads at most limit + offset of each followee's newest ids
   // from articles_author_idx, as SPEC.md's does, and the followee is the author.
+  // Followees several viewers of the plan share are looked at once (`hubs`).
+  // The depth-th newest article of one is a floor for those viewers' pages,
+  // which can hold nothing older, so every other followee's walk stops there;
+  // and one with 1,000 articles proves its followers' count without a count.
+  // An idea from the challenge's rust-epoll-WorriedArrow and
+  // rust-epoll-theCatWisel submissions; the SQL follows the latter's.
   ok =
     pool.register(
       "plan_feed",
-      planList(
-        "int8",
-        "",
-        "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.key)",
-        "SELECT y.id, fo.followee_id AS author FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
-          "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (q.lim::int + q.off::int)) y " +
-          "WHERE fo.follower_id = q.key ORDER BY y.id DESC LIMIT q.lim OFFSET q.off"
-      ),
+      "WITH w AS MATERIALIZED (SELECT q.key, q.lim, q.off, q.k FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY q(key, lim, off, k)), " +
+        "u AS MATERIALIZED (SELECT r.key, max(r.depth) AS depth, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.key) AS fids " +
+        "FROM (SELECT c.key, 1::int8 AS depth FROM unnest($1::int8[]) c(key) UNION ALL SELECT w.key, w.lim + w.off FROM w) r GROUP BY r.key), " +
+        "hubs AS MATERIALIZED (SELECT h.fid, (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id " +
+        "FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), " +
+        "capped AS MATERIALIZED (SELECT ARRAY(SELECT n.fid FROM (SELECT h.fid FROM hubs h WHERE h.floor_id IS NOT NULL ORDER BY h.floor_id DESC LIMIT 16) n " +
+        "WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = n.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999)) AS fids) " +
+        "SELECT -c.k, CASE WHEN cardinality(u.fids) = 0 THEN 0::int8 WHEN u.fids && capped.fids THEN 1000::int8 " +
+        "ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, NULL::int8[], NULL::int8[] " +
+        "FROM unnest($1::int8[]) WITH ORDINALITY c(key, k) JOIN u ON u.key = c.key CROSS JOIN capped " +
+        "UNION ALL SELECT w.k, NULL::int8, x.ids, x.authors FROM w JOIN u ON u.key = w.key " +
+        "CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0::int8) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl " +
+        planPage(
+          "SELECT y.id, fid AS author FROM unnest(u.fids) fid CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
+            "WHERE a2.author_id = fid AND a2.id >= fl.floor_id ORDER BY a2.id DESC LIMIT (w.lim + w.off)) y ORDER BY y.id DESC LIMIT w.lim OFFSET w.off"
+        ),
       none
     ) && ok
   // Every tag by name, once a plan: the tag list's answer, and the names, in
