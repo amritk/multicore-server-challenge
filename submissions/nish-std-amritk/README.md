@@ -11,7 +11,8 @@ connection; and a sign-up's hash waits 20 ms for company instead of 160
 Since #83: the profiles go through the read plans too, the favorites are
 folded into them, logins go to bcrypt services in their own processes, every
 connection sets `enable_memoize=off`, the viewers' flags are sent as one id
-array per viewer, half the CPUs serve HTTP (four on the box, where #83 ran
+array per viewer, a quarter of the CPUs serve HTTP (two on the box, each with a bigger
+read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
@@ -49,7 +50,8 @@ the compiler and its platform package.
 ## Design and optimizations
 
 - **Processes.** A prefork parent starts the HTTP workers and the bcrypt
-  services (half the CPUs each, at least two: four and four on the box), and
+  services (a quarter of the CPUs and half of them, at least two each: two
+and four on the box), and
   restarts none of them. Each HTTP worker binds `HOST:PORT` with `SO_REUSEPORT` and
   `TCP_NODELAY`, and runs one epoll loop over its listener, its keep-alive
   connections, its PostgreSQL connections and its connection to each bcrypt
@@ -199,11 +201,11 @@ Every request reads PostgreSQL, and there are no result, token or password
 caches. There are no schema or configuration changes, no CPU affinity and no
 host tuning.
 
-Optional process settings, with their defaults: `HTTP_WORKERS` (half the
+Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
-`DB_READ_CONNS` (3) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
+`DB_READ_CONNS` (4) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (`DB_READ_CONNS`) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (256) for the batch clock,
+`READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (512) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (160) and `BCRYPT_HASH_MS` (20),

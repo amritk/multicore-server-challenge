@@ -532,7 +532,7 @@ export class WorkerConfig {
    * oldest has waited `planWaitUs`: a batch clock. With `planClock` off, the
    * window applies only while another plan is in flight.
    */
-  planMin: i32 = 256
+  planMin: i32 = 512
   planWaitUs: i32 = 10000
   /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
   planClock: i32 = 1
@@ -639,7 +639,7 @@ export class ConduitWorker {
   ticketPlan: i32[]
   /** When each read in `planRing` came, in ns, by its place in the ring; and the start policy. */
   planAt: i64[]
-  planMin: i32 = 256
+  planMin: i32 = 512
   planWait: i64 = 0
   /** Whether the window gathers reads even while no plan runs: a batch clock (`WorkerConfig.planClock`). */
   planClock: i32 = 1

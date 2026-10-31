@@ -12,10 +12,10 @@
 // and the ports above it.
 //
 // Configured by the environment only: DATABASE_URL, JWT_SECRET, HOST, PORT
-// (the challenge's), and optionally HTTP_WORKERS (half the CPUs, at least 2), DB_READ_CONNS (3) and
+// (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (4) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
-// per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
+// per worker, READ_PLAN_MIN (512), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
@@ -118,12 +118,12 @@ export const main = (): i32 => {
   }
   cfg.host = getenv("HOST") ?? "0.0.0.0"
   cfg.port = envInt("PORT", 3000)
-  cfg.readConns = envInt("DB_READ_CONNS", 3)
+  cfg.readConns = envInt("DB_READ_CONNS", 4)
   cfg.writeConns = envInt("DB_WRITE_CONNS", 1)
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
   cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
-  cfg.planMin = envInt("READ_PLAN_MIN", 256)
+  cfg.planMin = envInt("READ_PLAN_MIN", 512)
   cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
@@ -134,10 +134,12 @@ export const main = (): i32 => {
   const gzip: string = getenv("GZIP") ?? "0"
   cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
   cfg.gzipMin = envInt("GZIP_MIN", 1300)
-  // Half the CPUs serve HTTP: on the challenge's 8 CPUs, 4 held 120,000 users
-  // on a VM like it where 2 held 100,000 and 5 tied 4 with longer tails.
+  // A quarter of the CPUs serve HTTP, each with its own read queue: at 120,000
+  // users on a VM like the challenge's, 2 workers' bigger plans cost Postgres
+  // 129 µs a request against 4 workers' 150, and 1 worker ran out of core.
   const half: i32 = availableParallelism() / 2
-  const http: i32 = envInt("HTTP_WORKERS", half > 2 ? half : 2)
+  const quarter: i32 = half / 2
+  const http: i32 = envInt("HTTP_WORKERS", quarter > 2 ? quarter : 2)
   // Logins wait on bcrypt, which gets a fair share of a core per process
   // while Postgres keeps every core busy: one process fell behind them.
   const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
